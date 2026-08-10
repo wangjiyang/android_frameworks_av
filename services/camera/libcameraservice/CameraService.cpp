@@ -1245,6 +1245,13 @@ Status CameraService::injectSessionParams(
  *   虚拟相机的 id。App 零改动、零感知 —— 这才是 "route" 的语义。
  *   (新增一个 id="2" 的相机没有意义:闲鱼根本不会去开它。)
  *
+ * ★ 落点有**两处**,不是一处(2026-08-09 对抗式 review 纠正):
+ *   ① `resolveCameraId()` —— 所有 **camera2** 入口(connectDevice /
+ *      getCameraCharacteristics / isSessionConfigurationSupported… 共 10 处)都汇聚到它;
+ *   ② `cameraIdIntToStrLocked()` —— 老 **Camera API1**(android.hardware.Camera)
+ *      走的是这条独立的路,**不经过** resolveCameraId。
+ *   只改 ① 会让 API1 的 App 静默拿到物理相机(面板显示"本机"、实际拍天花板、无报错)。
+ *
  * ★★ 三个条件必须同时成立才路由,任一不满足都**原样返回物理相机**:
  *   ① 远程协助会话激活 + 用户在控制端把开关拨到"本地相机"
  *      —— 由 AgentOsService 写 sys prop,会话结束/TTL 到期必清(单一收尾点)
@@ -1282,6 +1289,15 @@ std::optional<std::string> CameraService::maybeRouteToRemoteCamera(
     ALOGI("[agentos-camera] 相机请求 %s → 路由到控制端本机摄像头(%s)",
             inputCameraId.c_str(), virtualId.c_str());
     return virtualId;
+}
+
+/**
+ * 这个 cameraId 是不是"我们替身替进去的"那个虚拟相机?
+ * 权限校验要据此决定按哪个 deviceId 查(见 validateClientPermissionsLocked)。
+ */
+bool CameraService::isAgentOsRoutedCamera(const std::string& cameraId) const {
+    std::lock_guard<std::mutex> l(mAgentOsRouteLock);
+    return !mAgentOsRoutedCameraId.empty() && mAgentOsRoutedCameraId == cameraId;
 }
 
 std::optional<std::string> CameraService::resolveCameraId(
@@ -1383,6 +1399,19 @@ std::string CameraService::cameraIdIntToStrLocked(int cameraIdInt,
             callingPid, callingUid, /* checkCameraPermissions= */ false);
     if (systemCameraPermissions || getpid() == callingPid) {
         cameraIds = &mNormalDeviceIds;
+    }
+    // [AGENTOS_CAMERA_ROUTE] ★ 老 Camera API1(android.hardware.Camera)走的是这条路,
+    // **不经过 resolveCameraId** —— 只在那边做替身会漏掉所有 API1 的 App
+    // (国内不少电商/社交 App 和老 WebView/Cordova 壳还在用 API1)。
+    // 漏的后果特别具误导性:控制端面板显示"相机:本机(我这台)",
+    // 而那个 App 拿到的其实是被控机的物理相机 —— 对着天花板,且**没有任何报错**。
+    // 2026-08-09 对抗式 review 抓到。
+    if (cameraIdInt >= 0) {
+        std::optional<std::string> routed =
+                maybeRouteToRemoteCamera(std::to_string(cameraIdInt));
+        if (routed.has_value()) {
+            return routed.value();
+        }
     }
     if (cameraIdInt < 0 || cameraIdInt >= static_cast<int>(cameraIds->size())) {
         ALOGE("%s: input id %d invalid: valid range (0, %zu)",
@@ -1907,6 +1936,20 @@ Status CameraService::validateClientPermissionsLocked(
     auto [deviceId, _] = mVirtualDeviceCameraIdMapper.getDeviceIdAndMappedCameraIdPair(cameraId);
     AttributionSourceState clientAttributionWithDeviceId = clientAttribution;
     clientAttributionWithDeviceId.deviceId = deviceId;
+    // [AGENTOS_CAMERA_ROUTE] ★★ 如果这个 cameraId 是**我们替身替进去的**虚拟相机,
+    // 权限必须按 App **原本的**设备上下文(默认设备)来查,不能按虚拟设备查。
+    //
+    // 为什么(2026-08-09 对抗式 review 抓到,不改会让相机彻底打不开):
+    //   上面那两行会从 mapper 反查出"这个相机属于哪个虚拟设备",把 deviceId 改成虚拟设备的。
+    //   而发起请求的是普通 App(闲鱼),它的 Context.getDeviceId()==0,
+    //   跟那个虚拟设备毫无关系 → hasPermissionsForCamera 查不到对应授权
+    //   → ERROR_PERMISSION_DENIED → **相机根本打不开**。
+    //   那样 fail-safe 方向就反了:本意是"最坏拍到天花板",实际变成"相机坏了"。
+    //   替身是我们在 resolveCameraId 里悄悄做的,App 完全不知情,
+    //   自然也不该为此承担一个它无从满足的权限要求。
+    if (isAgentOsRoutedCamera(cameraId)) {
+        clientAttributionWithDeviceId.deviceId = clientAttribution.deviceId;
+    }
 
     // If it's not calling from cameraserver, check the permission if the
     // device isn't a system only camera (shouldRejectSystemCameraConnection already checks for

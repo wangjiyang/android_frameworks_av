@@ -1677,6 +1677,9 @@ private:
      * 返回 nullopt 表示"不路由,照常用物理相机"—— 这是绝大多数情况。
      */
     std::optional<std::string> maybeRouteToRemoteCamera(const std::string& inputCameraId);
+
+    /** 这个 cameraId 是不是我们替身替进去的虚拟相机(权限校验要按原设备上下文查)。 */
+    bool isAgentOsRoutedCamera(const std::string& cameraId) const;
 };
 
 } // namespace android
