@@ -1653,6 +1653,30 @@ private:
     void updateTorchUidMapLocked(const std::string& cameraId, int uid);
 
     VirtualDeviceCameraIdMapper mVirtualDeviceCameraIdMapper;
+
+    // ===== [AGENTOS_CAMERA_ROUTE] 远程协助:把相机请求路由到控制端本机摄像头 =====
+    // 见 CameraService.cpp 的 maybeRouteToRemoteCamera() 大段说明,以及
+    // tools/remote-desktop/DESIGN-camera-routing.md。
+    //
+    // 当前可用作"替身"的虚拟相机 id(HAL 侧真实 id)。空 = 没有可用虚拟相机,
+    // 此时即使路由开关是开的也**原样用物理相机**(fail-safe)。
+    // 在 onDeviceStatusChanged 的注册/移除两处维护 —— 移除处不能漏,
+    // 否则会指向已消失的相机,导致相机彻底打不开。
+    //
+    // ★★ 必须加锁:写在 onDeviceStatusChanged(HAL 回调线程),
+    //   读在 resolveCameraId(任意 App 的 binder 线程)—— 是真正的并发访问。
+    //   std::string 非原子,一边 assign 一边拷贝构造是 data race(UB,可能崩 cameraserver)。
+    //   ★ 这里**不能**复用 mServiceLock:resolveCameraId 的多数调用方已经持有它
+    //   (如 cameraIdIntToStrLocked 路径),复用会自死锁。用独立的小锁,
+    //   临界区只有一个 string 拷贝,不会成为瓶颈。
+    mutable std::mutex mAgentOsRouteLock;
+    std::string mAgentOsRoutedCameraId GUARDED_BY(mAgentOsRouteLock);
+
+    /**
+     * 远程协助会话期间,把 App 请求的物理相机 id 换成虚拟相机 id(控制端摄像头)。
+     * 返回 nullopt 表示"不路由,照常用物理相机"—— 这是绝大多数情况。
+     */
+    std::optional<std::string> maybeRouteToRemoteCamera(const std::string& inputCameraId);
 };
 
 } // namespace android

@@ -560,6 +560,17 @@ void CameraService::onDeviceStatusChanged(const std::string& cameraId,
         // to this device until the status changes
         updateStatus(StatusInternal::NOT_PRESENT, cameraId);
         mVirtualDeviceCameraIdMapper.removeCamera(cameraId);
+        // [AGENTOS_CAMERA_ROUTE] 虚拟相机没了就必须**立刻**清掉路由替身 id,
+        // 否则 resolveCameraId 会把 App 指向一个已经不存在的相机
+        // → 表现是"相机彻底打不开"(比不路由还糟)。fail-safe 要求这里绝不能漏。
+        {
+            std::lock_guard<std::mutex> l(mAgentOsRouteLock);
+            if (!mAgentOsRoutedCameraId.empty() && mAgentOsRoutedCameraId == cameraId) {
+                ALOGI("[agentos-camera] 用于路由的虚拟相机 %s 已移除,回退物理相机",
+                        cameraId.c_str());
+                mAgentOsRoutedCameraId.clear();
+            }
+        }
 
         std::vector<sp<BasicClient>> clientsToDisconnectOnline, clientsToDisconnectOffline;
         {
@@ -1217,12 +1228,74 @@ Status CameraService::injectSessionParams(
     return Status::ok();
 }
 
+/**
+ * ★★★ [AGENTOS_CAMERA_ROUTE] 远程协助期间把相机请求路由到控制端本机摄像头。
+ *
+ * 场景(用户 2026-08-09 提的需求):我在外地远程协助家里的手机,
+ * 被控机上的 App(闲鱼发布商品要"现场拍照")调起相机 —— 但手机在家里没人拿着,
+ * 拍出来只能是天花板。需要让**控制端**(我手上这台)的摄像头去当这个相机。
+ *
+ * ★ 为什么不能用 AOSP 官方的 VirtualCamera:
+ *   官方虚拟相机**只对 deviceId != 0(跑在虚拟屏上)的 App 可见** —— 就是下面
+ *   那个 early-return 干的事。而闲鱼跑在手机真实屏幕上 deviceId==0,
+ *   永远走第一个分支 → 只可能拿到物理相机。官方那条路是给"投屏到车机/PC"
+ *   设计的,不是给我们这个场景的。详见 tools/remote-desktop/DESIGN-camera-routing.md。
+ *
+ * ★ 所以做法是**替身**而不是**新增**:App 照常 open("0"),我们把它**换成**
+ *   虚拟相机的 id。App 零改动、零感知 —— 这才是 "route" 的语义。
+ *   (新增一个 id="2" 的相机没有意义:闲鱼根本不会去开它。)
+ *
+ * ★★ 三个条件必须同时成立才路由,任一不满足都**原样返回物理相机**:
+ *   ① 远程协助会话激活 + 用户在控制端把开关拨到"本地相机"
+ *      —— 由 AgentOsService 写 sys prop,会话结束/TTL 到期必清(单一收尾点)
+ *   ② 虚拟相机确实已注册(mapper 里查得到)
+ *   ③ 请求的是普通后置/前置相机 id
+ *   fail-safe 方向是"退回被控机自己的相机" —— 出任何岔子最坏结果是
+ *   "拍到天花板",而不是"相机打不开"。绝不能让这个功能把手机的相机搞坏。
+ *
+ * ⚠️ 这里**只在 deviceId==0 的默认设备分支**动手。虚拟设备(投屏车机等)那条
+ *   路径原样不动 —— 那是上游语义,我们没理由改。
+ */
+std::optional<std::string> CameraService::maybeRouteToRemoteCamera(
+        const std::string& inputCameraId) {
+    // 开关:只有 AgentOS 在"会话激活 + 用户选了本地相机"时才置 1。
+    // 用 sys prop 而不是新开 binder:cameraserver 是 native 进程,
+    // 让它反向依赖 system_server 会引入启动顺序和死锁风险,得不偿失。
+    // ★ 这个 prop 的 SELinux 类型必须让 cameraserver 可读、只有 system 可写
+    //   (见 device sepolicy;写错的话表现是"开关拨了没反应",要查 avc denied)。
+    if (property_get_bool("persist.agentos.camera.route_to_client", /*default_value=*/false)
+            == false) {
+        return std::nullopt;   // 绝大多数情况走这里,零开销
+    }
+    // 查有没有已注册的虚拟相机可用。没有就老老实实用物理相机。
+    // ★ 持锁拷一份再用:写方在 HAL 回调线程,不加锁就是 data race。
+    std::string virtualId;
+    {
+        std::lock_guard<std::mutex> l(mAgentOsRouteLock);
+        virtualId = mAgentOsRoutedCameraId;
+    }
+    if (virtualId.empty()) {
+        ALOGW("[agentos-camera] 路由开关是开的,但没有可用的虚拟相机,"
+              "回退物理相机 %s", inputCameraId.c_str());
+        return std::nullopt;
+    }
+    ALOGI("[agentos-camera] 相机请求 %s → 路由到控制端本机摄像头(%s)",
+            inputCameraId.c_str(), virtualId.c_str());
+    return virtualId;
+}
+
 std::optional<std::string> CameraService::resolveCameraId(
         const std::string& inputCameraId,
         int32_t deviceId,
         int32_t devicePolicy) {
     if ((deviceId == kDefaultDeviceId)
             || (devicePolicy == IVirtualDeviceManagerNative::DEVICE_POLICY_DEFAULT)) {
+        // [AGENTOS_CAMERA_ROUTE] 远程协助会话期间:把物理相机请求换成虚拟相机(控制端摄像头)。
+        // ★ 放在 mapper 检查**之前**:我们要拦的正是"App 请求物理相机 id"这一刻。
+        std::optional<std::string> routed = maybeRouteToRemoteCamera(inputCameraId);
+        if (routed.has_value()) {
+            return routed;
+        }
         auto [storedDeviceId, _] =
                 mVirtualDeviceCameraIdMapper.getDeviceIdAndMappedCameraIdPair(inputCameraId);
         if (storedDeviceId != kDefaultDeviceId) {
@@ -5982,6 +6055,17 @@ void CameraService::updateStatus(StatusInternal status, const std::string& camer
                 }
                 if (!mappedCameraId.empty()) {
                     mVirtualDeviceCameraIdMapper.addCamera(cameraId, deviceId, mappedCameraId);
+                    // [AGENTOS_CAMERA_ROUTE] 记下一个可用的虚拟相机 id,给远程协助的
+                    // "相机路由"当替身用(见 maybeRouteToRemoteCamera)。
+                    // ★ 只记后置那一个:App 请求哪个相机都路由到控制端的同一路上行流
+                    //   (控制端自己决定用它的前置还是后置),被控端不需要两个虚拟相机。
+                    if (mappedCameraId == kVirtualDeviceBackCameraId) {
+                        std::lock_guard<std::mutex> l(mAgentOsRouteLock);
+                        if (mAgentOsRoutedCameraId.empty()) {
+                            mAgentOsRoutedCameraId = cameraId;
+                            ALOGI("[agentos-camera] 可用于路由的虚拟相机: %s", cameraId.c_str());
+                        }
+                    }
                 }
             }
         }
