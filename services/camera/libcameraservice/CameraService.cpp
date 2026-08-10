@@ -1300,6 +1300,35 @@ bool CameraService::isAgentOsRoutedCamera(const std::string& cameraId) const {
     return !mAgentOsRoutedCameraId.empty() && mAgentOsRoutedCameraId == cameraId;
 }
 
+/**
+ * 这台相机能不能拿来当"相机路由"的替身?
+ *
+ * 判据 = **由软件喂帧的虚拟相机**。用 `INFO_SUPPORTED_HARDWARE_LEVEL == EXTERNAL`
+ * 识别:virtual_camera HAL 注册的相机固定报 EXTERNAL
+ * (VirtualCameraDevice.cc:272 `setSupportedHardwareLevel(..._EXTERNAL)`),
+ * 而本机的物理相机是 FULL(实测 `pm list features` 有
+ * android.hardware.camera.level.full),两者分得开。
+ *
+ * ★ 为什么不用 deviceId != 0 判定:2026-08-10 真机实测,virtual_camera 自带的
+ *   测试相机(`cmd virtual_camera enable_test_camera`)注册出来
+ *   deviceId **就是 0** —— 正因如此它才对普通 App 可见,而按 deviceId 挑会挑空。
+ * ★ 为什么不用 lensFacing 判定:测试相机是 EXTERNAL,将来真实的上行相机可能
+ *   声明成 BACK/FRONT,按朝向挑会再次挑空。
+ * ★ 为什么不查 provider 名("virtual/0"):那个常量是 CameraProviderManager.cpp
+ *   里的文件级静态,拿到这里要改头文件导出,为一个判据引入跨模块耦合不值当;
+ *   而 characteristics 本来就已经在手上了。
+ *
+ * ⚠️ 副作用要认:如果将来插一个**真的 USB 外接摄像头**(也报 EXTERNAL),
+ *   它会被当成可路由的替身。届时要再加一层区分(比如记下 virtual_camera HAL
+ *   注册时的 id 前缀)。当前设备没有 USB 摄像头路径,先不过度设计。
+ */
+bool CameraService::isAgentOsRoutableVirtualCamera(const CameraMetadata& chars) const {
+    camera_metadata_ro_entry_t entry =
+            chars.find(ANDROID_INFO_SUPPORTED_HARDWARE_LEVEL);
+    if (entry.count == 0) return false;
+    return entry.data.u8[0] == ANDROID_INFO_SUPPORTED_HARDWARE_LEVEL_EXTERNAL;
+}
+
 std::optional<std::string> CameraService::resolveCameraId(
         const std::string& inputCameraId,
         int32_t deviceId,
@@ -6098,18 +6127,33 @@ void CameraService::updateStatus(StatusInternal status, const std::string& camer
                 }
                 if (!mappedCameraId.empty()) {
                     mVirtualDeviceCameraIdMapper.addCamera(cameraId, deviceId, mappedCameraId);
-                    // [AGENTOS_CAMERA_ROUTE] 记下一个可用的虚拟相机 id,给远程协助的
-                    // "相机路由"当替身用(见 maybeRouteToRemoteCamera)。
-                    // ★ 只记后置那一个:App 请求哪个相机都路由到控制端的同一路上行流
-                    //   (控制端自己决定用它的前置还是后置),被控端不需要两个虚拟相机。
-                    if (mappedCameraId == kVirtualDeviceBackCameraId) {
-                        std::lock_guard<std::mutex> l(mAgentOsRouteLock);
-                        if (mAgentOsRoutedCameraId.empty()) {
-                            mAgentOsRoutedCameraId = cameraId;
-                            ALOGI("[agentos-camera] 可用于路由的虚拟相机: %s", cameraId.c_str());
-                        }
-                    }
                 }
+            }
+        }
+        // [AGENTOS_CAMERA_ROUTE] 记下一个可用作"替身"的虚拟相机。
+        //
+        // ★★ 2026-08-10 真机实测修正:**不能**挂在上面那个
+        //   `if (deviceId != kDefaultDeviceId)` 里面。
+        //   e2e 实测(virtual_camera 自带的测试相机 `cmd virtual_camera
+        //   enable_test_camera`)注册出来的是 `device@1.1/virtual/1001`,
+        //   它的 deviceId **就是 kDefaultDeviceId(0)** —— 正因为如此它才对
+        //   deviceId=0 的普通 App 可见,也正因为如此上面那个分支根本不会执行,
+        //   于是 mAgentOsRoutedCameraId 永远是空,替身逻辑永远 fallback。
+        //   现象:开关全绿、cameraserver 也读到了,就是"没有可用的虚拟相机"。
+        //
+        // ★ 判定改用**provider 身份**:virtual_camera HAL 注册的相机路径里带
+        //   "/virtual/"(见 virtual_camera.hal.rc 的
+        //   `android.hardware.camera.provider.ICameraProvider/virtual/0`)。
+        //   这比"属于哪个虚拟设备"更贴近我们真正想要的语义:
+        //   "这是一台由软件喂帧的相机,可以拿来当替身"。
+        //
+        // ⚠️ 不要用 lensFacing 过滤:测试相机默认 EXTERNAL,真实上行相机将来
+        //   可能是 BACK/FRONT/EXTERNAL 任意一种,按朝向挑会再次挑空。
+        if (res == OK && isAgentOsRoutableVirtualCamera(cameraInfo)) {
+            std::lock_guard<std::mutex> l(mAgentOsRouteLock);
+            if (mAgentOsRoutedCameraId.empty()) {
+                mAgentOsRoutedCameraId = cameraId;
+                ALOGI("[agentos-camera] 可用于路由的虚拟相机: %s", cameraId.c_str());
             }
         }
     }

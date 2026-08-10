@@ -1680,6 +1680,9 @@ private:
 
     /** 这个 cameraId 是不是我们替身替进去的虚拟相机(权限校验要按原设备上下文查)。 */
     bool isAgentOsRoutedCamera(const std::string& cameraId) const;
+
+    /** 这台相机能不能当"相机路由"的替身(= 由软件喂帧的虚拟相机)。 */
+    bool isAgentOsRoutableVirtualCamera(const CameraMetadata& chars) const;
 };
 
 } // namespace android
