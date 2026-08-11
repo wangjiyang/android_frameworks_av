@@ -1292,6 +1292,20 @@ std::optional<std::string> CameraService::maybeRouteToRemoteCamera(
         property_get("persist.agentos.camera.scope", scope, "all");
         if (strcmp(scope, "list") == 0) {
             const int callingUid = getCallingUid();
+            // ★★ 2026-08-11 真机实测:33 次请求正确拒绝,**仍有 1 次漏过去**。
+            //   原因是有些路径**不在 binder 事务里**调到这里(如相机枚举/内部回调),
+            //   此时 `getCallingUid()` 返回的是 **cameraserver 自己的 uid(1047)**,
+            //   而不是真正的 App。名单里如果碰巧有这个 uid 就会误放行;
+            //   即使没有,这也是一次"判据依据不可靠"的调用。
+            //   → **拿不到真实调用方时一律不接管**(fail-safe 方向朝"用物理相机"),
+            //     最坏是"该接管的没接管"(用户看得见、能再点一次),
+            //     而不是"不该接管的被接管了"(拍到别人的画面,静默且危险)。
+            const int myUid = static_cast<int>(getuid());
+            if (callingUid == myUid || callingUid == AID_SYSTEM || callingUid < AID_APP_START) {
+                ALOGI("[agentos-camera] 调用方 uid=%d 不是普通 App(拿不到真实调用方),"
+                      "按名单模式一律不接管", callingUid);
+                return std::nullopt;
+            }
             char uidList[PROPERTY_VALUE_MAX] = {0};
             property_get("persist.agentos.camera.uids", uidList, "");
             // 格式:",10110,10234," —— 前后都带逗号,这样 strstr 匹配
