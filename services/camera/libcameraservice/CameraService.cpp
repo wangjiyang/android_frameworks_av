@@ -1274,6 +1274,35 @@ std::optional<std::string> CameraService::maybeRouteToRemoteCamera(
             == false) {
         return std::nullopt;   // 绝大多数情况走这里,零开销
     }
+    // ════════════════════════════════════════════════════════════════
+    // [AGENTOS_CAMERA_SCOPE] 接管范围:全部 / 仅名单内的 App
+    // ════════════════════════════════════════════════════════════════
+    // 用户要求(2026-08-11):不是每个 App 都该被接管。
+    //   · scope=all   —— 全部接管(默认,保持原行为)
+    //   · scope=list  —— 只接管名单里的 App
+    // 名单由 system_server 侧解析成 **UID 列表**再写进 prop,
+    // 这里只做整数匹配。
+    //
+    // ★ 为什么不在 cameraserver 里做 UID→包名 解析:
+    //   那要反向调 PackageManager(在 system_server 里),而我们正处在
+    //   相机打开的关键路径上,还持着锁 —— 引入跨进程依赖 = 启动顺序 + 死锁风险。
+    //   把解析放在 system_server(它本来就有 PM),这边只比整数,零风险。
+    {
+        char scope[PROPERTY_VALUE_MAX] = {0};
+        property_get("persist.agentos.camera.scope", scope, "all");
+        if (strcmp(scope, "list") == 0) {
+            const int callingUid = getCallingUid();
+            char uidList[PROPERTY_VALUE_MAX] = {0};
+            property_get("persist.agentos.camera.uids", uidList, "");
+            // 格式:",10110,10234," —— 前后都带逗号,这样 strstr 匹配
+            // ",10110," 不会误命中 "110110"。★ 别改成不带逗号的写法。
+            std::string needle = "," + std::to_string(callingUid) + ",";
+            if (strstr(uidList, needle.c_str()) == nullptr) {
+                ALOGI("[agentos-camera] uid=%d 不在接管名单里,用物理相机", callingUid);
+                return std::nullopt;
+            }
+        }
+    }
     // 查有没有已注册的虚拟相机可用。没有就老老实实用物理相机。
     // ★ 持锁拷一份再用:写方在 HAL 回调线程,不加锁就是 data race。
     std::string virtualId;
@@ -1284,6 +1313,14 @@ std::optional<std::string> CameraService::maybeRouteToRemoteCamera(
     if (virtualId.empty()) {
         ALOGW("[agentos-camera] 路由开关是开的,但没有可用的虚拟相机,"
               "回退物理相机 %s", inputCameraId.c_str());
+        return std::nullopt;
+    }
+    // ★ 请求的**就是**替身自己 → 原样返回,不要"路由到自己"。
+    //   2026-08-10 真机实测看到 `相机请求 v0_1004 → 路由到…(v0_1004)`:
+    //   虚拟相机注册后也会出现在相机列表里,App 枚举时会连它一起打开。
+    //   自己路由到自己虽然结果正确,但① 日志噪声大、掩盖真正的替身事件;
+    //   ② 万一将来加了"路由前先做点什么"的逻辑,就是一个自指的坑。
+    if (inputCameraId == virtualId) {
         return std::nullopt;
     }
     ALOGI("[agentos-camera] 相机请求 %s → 路由到控制端本机摄像头(%s)",
