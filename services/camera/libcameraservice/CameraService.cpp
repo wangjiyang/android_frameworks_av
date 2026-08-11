@@ -563,13 +563,26 @@ void CameraService::onDeviceStatusChanged(const std::string& cameraId,
         // [AGENTOS_CAMERA_ROUTE] 虚拟相机没了就必须**立刻**清掉路由替身 id,
         // 否则 resolveCameraId 会把 App 指向一个已经不存在的相机
         // → 表现是"相机彻底打不开"(比不路由还糟)。fail-safe 要求这里绝不能漏。
+        //
+        // ★ 双台之后要**遍历 map 按 value 删**:同一台虚拟相机只会占一个朝向槽,
+        //   但我们手上只有 id,不知道它当初登记在哪个 facing 下(注册时的 facing
+        //   来自 characteristics,此刻相机已经没了,再查一次未必查得到 —— 更何况
+        //   路由路径上禁止查 characteristics)。遍历 6 个以内的表,代价可忽略。
+        // ★ 物理相机被移除时也要把它从 facing 表里删掉,否则表会随插拔单调增长,
+        //   并且留下"指向已消失相机"的陈旧条目。
         {
             std::lock_guard<std::mutex> l(mAgentOsRouteLock);
-            if (!mAgentOsRoutedCameraId.empty() && mAgentOsRoutedCameraId == cameraId) {
-                ALOGI("[agentos-camera] 用于路由的虚拟相机 %s 已移除,回退物理相机",
-                        cameraId.c_str());
-                mAgentOsRoutedCameraId.clear();
+            for (auto it = mAgentOsRoutedCameraIds.begin();
+                    it != mAgentOsRoutedCameraIds.end(); ) {
+                if (it->second == cameraId) {
+                    ALOGI("[agentos-camera] 用于路由的虚拟相机 %s(facing=%d)已移除,"
+                          "该朝向回退物理相机", cameraId.c_str(), (int)it->first);
+                    it = mAgentOsRoutedCameraIds.erase(it);
+                } else {
+                    ++it;
+                }
             }
+            mAgentOsPhysicalFacing.erase(cameraId);
         }
 
         std::vector<sp<BasicClient>> clientsToDisconnectOnline, clientsToDisconnectOffline;
@@ -1317,28 +1330,67 @@ std::optional<std::string> CameraService::maybeRouteToRemoteCamera(
             }
         }
     }
-    // 查有没有已注册的虚拟相机可用。没有就老老实实用物理相机。
-    // ★ 持锁拷一份再用:写方在 HAL 回调线程,不加锁就是 data race。
+    // ════════════════════════════════════════════════════════════════
+    // 按**朝向**选替身:物理 id --mAgentOsPhysicalFacing--> facing
+    //                        --mAgentOsRoutedCameraIds--> 虚拟 id
+    // ════════════════════════════════════════════════════════════════
+    // ★★★ 这里**只查表,绝对不许调 getCameraCharacteristics**。
+    //   本函数有一个调用点在 mServiceLock 之下(getCameraInfo → cameraIdIntToStrLocked),
+    //   而 getCameraCharacteristics 要取 CameraProviderManager::mInterfaceMutex。
+    //   在相机打开的关键路径上 mServiceLock→mInterfaceMutex 是往既有锁序里
+    //   **新增一条边** = cameraserver 死锁 = 全机相机全废。所以朝向必须在
+    //   注册时(updateStatus)就记好,这里纯查表、临界区只有两次 map lookup。
+    //
+    // ★ 持锁拷出结果再用:写方在 HAL 回调线程,不加锁就是 data race。
     std::string virtualId;
+    uint8_t facing = 0;
+    bool knownFacing = false;
     {
         std::lock_guard<std::mutex> l(mAgentOsRouteLock);
-        virtualId = mAgentOsRoutedCameraId;
+        if (mAgentOsRoutedCameraIds.empty()) {
+            ALOGW("[agentos-camera] 路由开关是开的,但没有可用的虚拟相机,"
+                  "回退物理相机 %s", inputCameraId.c_str());
+            return std::nullopt;
+        }
+        // ★ 请求的**就是**替身自己 → 原样返回,不要"路由到自己"。
+        //   2026-08-10 真机实测看到 `相机请求 v0_1004 → 路由到…(v0_1004)`:
+        //   虚拟相机注册后也会出现在相机列表里,App 枚举时会连它一起打开。
+        //   自己路由到自己虽然结果正确,但① 日志噪声大、掩盖真正的替身事件;
+        //   ② 万一将来加了"路由前先做点什么"的逻辑,就是一个自指的坑。
+        //   ⚠️ 双台之后这个判断必须对**所有**替身做,不能只比一个。
+        for (const auto& kv : mAgentOsRoutedCameraIds) {
+            if (kv.second == inputCameraId) {
+                return std::nullopt;
+            }
+        }
+        auto fit = mAgentOsPhysicalFacing.find(inputCameraId);
+        if (fit != mAgentOsPhysicalFacing.end()) {
+            facing = fit->second;
+            knownFacing = true;
+            auto vit = mAgentOsRoutedCameraIds.find(facing);
+            if (vit != mAgentOsRoutedCameraIds.end()) {
+                virtualId = vit->second;
+            }
+        }
+    }
+    if (!knownFacing) {
+        // 没登记过朝向:要么这个 id 根本不存在(API1 传了越界序号、App 传了乱码),
+        // 要么它在我们记录之前就 PRESENT 了。两种情况都**不路由** —— 我们宁可
+        // "该接管的没接管"(用户看得见),也不要把请求指到一台不对的相机上。
+        ALOGW("[agentos-camera] 相机 %s 没有登记朝向,不路由,用物理相机",
+                inputCameraId.c_str());
+        return std::nullopt;
     }
     if (virtualId.empty()) {
-        ALOGW("[agentos-camera] 路由开关是开的,但没有可用的虚拟相机,"
-              "回退物理相机 %s", inputCameraId.c_str());
+        // ★ fail-safe 的关键分支:控制端**没有**这个朝向的摄像头(例如它没有前置)。
+        //   此时正确做法是让被控机用**自己的物理前置**,而不是硬塞一台
+        //   永远黑屏的替身 —— 后者是"信令全绿但画面全黑"那一类最难查的故障。
+        ALOGW("[agentos-camera] 相机 %s(facing=%d)没有对应朝向的替身,用物理相机",
+                inputCameraId.c_str(), (int)facing);
         return std::nullopt;
     }
-    // ★ 请求的**就是**替身自己 → 原样返回,不要"路由到自己"。
-    //   2026-08-10 真机实测看到 `相机请求 v0_1004 → 路由到…(v0_1004)`:
-    //   虚拟相机注册后也会出现在相机列表里,App 枚举时会连它一起打开。
-    //   自己路由到自己虽然结果正确,但① 日志噪声大、掩盖真正的替身事件;
-    //   ② 万一将来加了"路由前先做点什么"的逻辑,就是一个自指的坑。
-    if (inputCameraId == virtualId) {
-        return std::nullopt;
-    }
-    ALOGI("[agentos-camera] 相机请求 %s → 路由到控制端本机摄像头(%s)",
-            inputCameraId.c_str(), virtualId.c_str());
+    ALOGI("[agentos-camera] 相机请求 %s(facing=%d)→ 路由到控制端同朝向摄像头(%s)",
+            inputCameraId.c_str(), (int)facing, virtualId.c_str());
     return virtualId;
 }
 
@@ -1348,7 +1400,26 @@ std::optional<std::string> CameraService::maybeRouteToRemoteCamera(
  */
 bool CameraService::isAgentOsRoutedCamera(const std::string& cameraId) const {
     std::lock_guard<std::mutex> l(mAgentOsRouteLock);
-    return !mAgentOsRoutedCameraId.empty() && mAgentOsRoutedCameraId == cameraId;
+    // ★ 双台之后:只要是**任一朝向**的替身就算。漏掉其中一台的后果是
+    //   那台相机的权限校验按错误的 deviceId 去查 → 前置能路由但打不开,
+    //   而后置一切正常 —— 典型的"只坏一半"、极难联想到这里。
+    for (const auto& kv : mAgentOsRoutedCameraIds) {
+        if (kv.second == cameraId) return true;
+    }
+    return false;
+}
+
+/**
+ * 从 characteristics 里读 lensFacing。
+ *
+ * ⚠️⚠️ 必须先判 `entry.count > 0` 再取 `data.u8[0]`。同文件 updateStatus() 里
+ *   上游那段(读 ANDROID_LENS_FACING 给 VirtualDeviceCameraIdMapper 用)**没判**,
+ *   metadata 里缺这个 tag 时就是越界读。那是上游的隐患,我们不照抄。
+ */
+std::optional<uint8_t> CameraService::getAgentOsLensFacing(const CameraMetadata& chars) const {
+    camera_metadata_ro_entry_t entry = chars.find(ANDROID_LENS_FACING);
+    if (entry.count == 0) return std::nullopt;
+    return entry.data.u8[0];
 }
 
 /**
@@ -1369,11 +1440,21 @@ bool CameraService::isAgentOsRoutedCamera(const std::string& cameraId) const {
  *   里的文件级静态,拿到这里要改头文件导出,为一个判据引入跨模块耦合不值当;
  *   而 characteristics 本来就已经在手上了。
  *
- * ⚠️ 副作用要认:如果将来插一个**真的 USB 外接摄像头**(也报 EXTERNAL),
- *   它会被当成可路由的替身。届时要再加一层区分(比如记下 virtual_camera HAL
- *   注册时的 id 前缀)。当前设备没有 USB 摄像头路径,先不过度设计。
+ * ★★ 2026-08-11 加固:**同时**要求 camera id 以 'v' 开头。
+ *   原来只看 EXTERNAL,注释里已自认"插一个真的 USB 外接摄像头(也报 EXTERNAL)
+ *   会被当成替身"。改成按朝向的双台之后这个风险**加倍**:USB 摄像头会去
+ *   占掉某个朝向的槽位,把真正的替身挤掉(map 里同 facing 后写的覆盖先写的),
+ *   现象是"前置(或后置)路由到了一台完全不相干的相机",且毫无报错。
+ *   'v' 是 virtual_camera HAL 生成 id 的固定前缀
+ *   (VirtualCameraService.cc:63 `kCameraIdPrefix[] = "v"`,createCameraId() 拼成
+ *    "v<deviceId>_<seq>",如实测到的 v0_1004)。
+ *   物理相机是纯数字 id("0".."5"),UVC/外接是 provider 自己的命名,都不以 'v' 开头。
+ * ⚠️ 代价:如果哪天换成别的 HAL 来喂帧(不叫 v* 的 id),这里会**静默挑空**
+ *   → 现象是"开关全绿但说没有可用的虚拟相机"。改喂帧实现时记得同步改这里。
  */
-bool CameraService::isAgentOsRoutableVirtualCamera(const CameraMetadata& chars) const {
+bool CameraService::isAgentOsRoutableVirtualCamera(const std::string& cameraId,
+        const CameraMetadata& chars) const {
+    if (cameraId.empty() || cameraId[0] != 'v') return false;
     camera_metadata_ro_entry_t entry =
             chars.find(ANDROID_INFO_SUPPORTED_HARDWARE_LEVEL);
     if (entry.count == 0) return false;
@@ -1480,26 +1561,38 @@ std::string CameraService::cameraIdIntToStrLocked(int cameraIdInt,
     if (systemCameraPermissions || getpid() == callingPid) {
         cameraIds = &mNormalDeviceIds;
     }
+    if (cameraIdInt < 0 || cameraIdInt >= static_cast<int>(cameraIds->size())) {
+        ALOGE("%s: input id %d invalid: valid range (0, %zu)",
+                __FUNCTION__, cameraIdInt, cameraIds->size());
+        return std::string{};
+    }
+    const std::string& physicalCameraId = (*cameraIds)[cameraIdInt];
+
     // [AGENTOS_CAMERA_ROUTE] ★ 老 Camera API1(android.hardware.Camera)走的是这条路,
     // **不经过 resolveCameraId** —— 只在那边做替身会漏掉所有 API1 的 App
     // (国内不少电商/社交 App 和老 WebView/Cordova 壳还在用 API1)。
     // 漏的后果特别具误导性:控制端面板显示"相机:本机(我这台)",
     // 而那个 App 拿到的其实是被控机的物理相机 —— 对着天花板,且**没有任何报错**。
     // 2026-08-09 对抗式 review 抓到。
-    if (cameraIdInt >= 0) {
-        std::optional<std::string> routed =
-                maybeRouteToRemoteCamera(std::to_string(cameraIdInt));
-        if (routed.has_value()) {
-            return routed.value();
-        }
-    }
-    if (cameraIdInt < 0 || cameraIdInt >= static_cast<int>(cameraIds->size())) {
-        ALOGE("%s: input id %d invalid: valid range (0, %zu)",
-                __FUNCTION__, cameraIdInt, cameraIds->size());
-        return std::string{};
+    //
+    // ★★ 2026-08-11 修正两处(原来这块在越界检查**之前**):
+    //   ① 之前用 `std::to_string(cameraIdInt)` 把 API1 的**序号**直接当成 HAL 的
+    //      camera id 字符串。这两者语义不同:序号是 mNormalDeviceIds 里的**下标**,
+    //      id 是 HAL 给的字符串。按朝向路由之后这个区别是致命的 —— 查 facing 表
+    //      要用真 id,拿序号去查会查不到(或查到另一台相机的朝向)。
+    //      改成先取 (*cameraIds)[cameraIdInt] 拿到**真 id** 再去路由。
+    //   ② 之前路由在越界检查之前 → 请求一个**不存在的序号**(比如 99)也会被路由,
+    //      返回一台真实存在的虚拟相机,把本该是 ILLEGAL_ARGUMENT 的错误吞掉。
+    //      挪到越界检查之后就一并修掉了。
+    //   ⚠️ 如实说明:本机上 mNormalDeviceIds 恰好是 {"0","1",...},序号与 id
+    //      逐字符相同,所以 ① **在本机上观察不到任何行为差异**,无法用真机验证 ——
+    //      属于防御性修正(换设备/换 HAL 命名就会咬人)。
+    std::optional<std::string> routed = maybeRouteToRemoteCamera(physicalCameraId);
+    if (routed.has_value()) {
+        return routed.value();
     }
 
-    return (*cameraIds)[cameraIdInt];
+    return physicalCameraId;
 }
 
 std::string CameraService::cameraIdIntToStr(int cameraIdInt, int32_t deviceId,
@@ -6181,7 +6274,7 @@ void CameraService::updateStatus(StatusInternal status, const std::string& camer
                 }
             }
         }
-        // [AGENTOS_CAMERA_ROUTE] 记下一个可用作"替身"的虚拟相机。
+        // [AGENTOS_CAMERA_ROUTE] 登记"替身"虚拟相机 + 物理相机的朝向。
         //
         // ★★ 2026-08-10 真机实测修正:**不能**挂在上面那个
         //   `if (deviceId != kDefaultDeviceId)` 里面。
@@ -6189,22 +6282,48 @@ void CameraService::updateStatus(StatusInternal status, const std::string& camer
         //   enable_test_camera`)注册出来的是 `device@1.1/virtual/1001`,
         //   它的 deviceId **就是 kDefaultDeviceId(0)** —— 正因为如此它才对
         //   deviceId=0 的普通 App 可见,也正因为如此上面那个分支根本不会执行,
-        //   于是 mAgentOsRoutedCameraId 永远是空,替身逻辑永远 fallback。
+        //   替身表永远是空的,替身逻辑永远 fallback。
         //   现象:开关全绿、cameraserver 也读到了,就是"没有可用的虚拟相机"。
         //
-        // ★ 判定改用**provider 身份**:virtual_camera HAL 注册的相机路径里带
-        //   "/virtual/"(见 virtual_camera.hal.rc 的
-        //   `android.hardware.camera.provider.ICameraProvider/virtual/0`)。
-        //   这比"属于哪个虚拟设备"更贴近我们真正想要的语义:
-        //   "这是一台由软件喂帧的相机,可以拿来当替身"。
+        // ★ "是不是替身"的判据见 isAgentOsRoutableVirtualCamera()
+        //   (EXTERNAL hardware level + id 以 'v' 开头)。
         //
-        // ⚠️ 不要用 lensFacing 过滤:测试相机默认 EXTERNAL,真实上行相机将来
-        //   可能是 BACK/FRONT/EXTERNAL 任意一种,按朝向挑会再次挑空。
-        if (res == OK && isAgentOsRoutableVirtualCamera(cameraInfo)) {
-            std::lock_guard<std::mutex> l(mAgentOsRouteLock);
-            if (mAgentOsRoutedCameraId.empty()) {
-                mAgentOsRoutedCameraId = cameraId;
-                ALOGI("[agentos-camera] 可用于路由的虚拟相机: %s", cameraId.c_str());
+        // ⚠️ 不要用 lensFacing 过滤**能不能当替身**:测试相机默认 EXTERNAL,
+        //   真实上行相机可能是 BACK/FRONT/EXTERNAL 任意一种,按朝向筛会挑空。
+        //   (朝向只用来决定它占哪个槽位,不用来决定它是不是替身。)
+        //
+        // ★★★ 2026-08-11 改成按朝向登记两张表(见 CameraService.h 的说明)。
+        //   这里是**唯一**能安全读 characteristics 的地方 —— 我们已经在
+        //   updateStatus 里拿到 cameraInfo 了,而路由路径上持着 mServiceLock,
+        //   在那边再去查 characteristics 会取 mInterfaceMutex → 死锁风险。
+        //   所以朝向必须在这一刻就落表,不能留到路由时现查。
+        if (res == OK) {
+            std::optional<uint8_t> facing = getAgentOsLensFacing(cameraInfo);
+            if (isAgentOsRoutableVirtualCamera(cameraId, cameraInfo)) {
+                // ★ 去掉了老代码里的 `if (mAgentOsRoutedCameraId.empty())`:
+                //   那个判断让**第二台**替身(前置)被静默丢弃 —— 正是
+                //   "被控端永远切不到前置"的直接原因。
+                // 替身没报朝向(EXTERNAL 或压根没有这个 tag)时按 BACK 登记:
+                // 单台替身的老行为就是"什么都路由到它",保持向后兼容;
+                // 而 App 绝大多数默认请求的就是后置。
+                uint8_t slot = ANDROID_LENS_FACING_BACK;
+                if (facing.has_value() && (*facing == ANDROID_LENS_FACING_BACK
+                        || *facing == ANDROID_LENS_FACING_FRONT)) {
+                    slot = *facing;
+                }
+                std::lock_guard<std::mutex> l(mAgentOsRouteLock);
+                // ⚠️ 同一朝向重复注册就覆盖(后来的赢):控制端换了摄像头会先
+                //   注册新的再移除旧的,覆盖能保证表里永远是最新那台。
+                //   若反过来保留旧的,旧那台随后被移除,该朝向就空了。
+                mAgentOsRoutedCameraIds[slot] = cameraId;
+                ALOGI("[agentos-camera] 可用于路由的虚拟相机: %s(登记为 facing=%d)",
+                        cameraId.c_str(), (int)slot);
+            } else if (facing.has_value()) {
+                // 非替身(= 本机物理相机,含 4 个后置副摄):记下它的朝向,
+                // 路由时才有 `物理 id → facing` 这一跳。★ 这张表不记就等于
+                // 路由永远查不到朝向 → 一律 fallback,功能整体静默失效。
+                std::lock_guard<std::mutex> l(mAgentOsRouteLock);
+                mAgentOsPhysicalFacing[cameraId] = *facing;
             }
         }
     }

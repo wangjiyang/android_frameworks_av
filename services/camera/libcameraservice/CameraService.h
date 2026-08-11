@@ -1658,19 +1658,42 @@ private:
     // 见 CameraService.cpp 的 maybeRouteToRemoteCamera() 大段说明,以及
     // tools/remote-desktop/DESIGN-camera-routing.md。
     //
-    // 当前可用作"替身"的虚拟相机 id(HAL 侧真实 id)。空 = 没有可用虚拟相机,
-    // 此时即使路由开关是开的也**原样用物理相机**(fail-safe)。
-    // 在 onDeviceStatusChanged 的注册/移除两处维护 —— 移除处不能漏,
+    // ★★★ 2026-08-11 改:单台替身 → **按朝向的双台**(BACK + FRONT)。
+    //   老实现把**任何** id 都换成同一台 lensFacing=BACK 的虚拟相机,于是
+    //   被控端 App 请求前置(物理 id "1")时拿到的还是后置画面 —— **永远切不到前置**,
+    //   而且没有任何报错(App 只是显示了一路"不对的画面")。
+    //
+    // 两张表,都在 updateStatus() 的 PRESENT 分支里填:
+    //   ① mAgentOsRoutedCameraIds : lensFacing → 虚拟相机 id(替身,控制端摄像头)
+    //   ② mAgentOsPhysicalFacing  : 物理相机 id → lensFacing
+    // 路由时走 `物理 id --②--> facing --①--> 虚拟 id`,**全程只查表**。
+    //
+    // ★★★ 为什么必须预先把 facing 存下来,而不是路由时现查 characteristics:
+    //   maybeRouteToRemoteCamera() 有一个调用点在 **mServiceLock 之下**
+    //   (getCameraInfo() 里 `Mutex::Autolock l(mServiceLock)` → cameraIdIntToStrLocked
+    //    → 本函数),而 CameraProviderManager::getCameraCharacteristics() 要取
+    //   mInterfaceMutex。在相机打开的关键路径上 mServiceLock→mInterfaceMutex
+    //   等于往既有锁序里新加一条边 = **cameraserver 死锁 = 全机相机全废**。
+    //   这条不许赌:任何时候都不要在路由路径上调 getCameraCharacteristics。
+    //
+    // 空表 / 查不到对应朝向 = **原样用物理相机**(fail-safe)。比如控制端根本没有
+    // 前置摄像头时,被控机就该用自己的物理前置,而不是给一台永远黑屏的虚拟相机。
+    //
+    // 两张表都在 onDeviceStatusChanged 的注册/移除两处维护 —— 移除处不能漏,
     // 否则会指向已消失的相机,导致相机彻底打不开。
     //
     // ★★ 必须加锁:写在 onDeviceStatusChanged(HAL 回调线程),
     //   读在 resolveCameraId(任意 App 的 binder 线程)—— 是真正的并发访问。
-    //   std::string 非原子,一边 assign 一边拷贝构造是 data race(UB,可能崩 cameraserver)。
+    //   容器非原子,一边 insert 一边遍历是 data race(UB,可能崩 cameraserver)。
     //   ★ 这里**不能**复用 mServiceLock:resolveCameraId 的多数调用方已经持有它
     //   (如 cameraIdIntToStrLocked 路径),复用会自死锁。用独立的小锁,
-    //   临界区只有一个 string 拷贝,不会成为瓶颈。
+    //   临界区只有一次查表,不会成为瓶颈。
     mutable std::mutex mAgentOsRouteLock;
-    std::string mAgentOsRoutedCameraId GUARDED_BY(mAgentOsRouteLock);
+    // key = camera_metadata_enum_android_lens_facing_t(FRONT=0 / BACK=1 / EXTERNAL=2)
+    std::map<uint8_t, std::string> mAgentOsRoutedCameraIds GUARDED_BY(mAgentOsRouteLock);
+    // 物理相机(以及一切非替身相机)的 id → lensFacing。本机是 0=Back,1=Front,
+    // 另有 4 个 Back 副摄 —— 副摄同样映射到 BACK 那台替身,符合直觉。
+    std::map<std::string, uint8_t> mAgentOsPhysicalFacing GUARDED_BY(mAgentOsRouteLock);
 
     /**
      * 远程协助会话期间,把 App 请求的物理相机 id 换成虚拟相机 id(控制端摄像头)。
@@ -1681,8 +1704,18 @@ private:
     /** 这个 cameraId 是不是我们替身替进去的虚拟相机(权限校验要按原设备上下文查)。 */
     bool isAgentOsRoutedCamera(const std::string& cameraId) const;
 
-    /** 这台相机能不能当"相机路由"的替身(= 由软件喂帧的虚拟相机)。 */
-    bool isAgentOsRoutableVirtualCamera(const CameraMetadata& chars) const;
+    /**
+     * 这台相机能不能当"相机路由"的替身(= 由软件喂帧的虚拟相机)。
+     * ★ 要 cameraId 是因为判据里还要看 id 前缀(见 .cpp 里的说明)。
+     */
+    bool isAgentOsRoutableVirtualCamera(const std::string& cameraId,
+            const CameraMetadata& chars) const;
+
+    /**
+     * 从 characteristics 里读 lensFacing。读不到返回 nullopt
+     * (⚠️ 必须判 entry.count,上游同文件里有一处没判是越界读的隐患,别照抄)。
+     */
+    std::optional<uint8_t> getAgentOsLensFacing(const CameraMetadata& chars) const;
 };
 
 } // namespace android
