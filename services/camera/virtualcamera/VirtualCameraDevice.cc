@@ -14,7 +14,16 @@
  * limitations under the License.
  */
 
-// #define LOG_NDEBUG 0
+// ★ 打开 ALOGV(2026-08-11,排查"相机 App 配不出会话"必需)。
+//   上游默认是注释掉的 → NDEBUG 下 ALOGV 被**编译期整个消掉**,
+//   连字符串都不在二进制里,`setprop log.tag.VirtualCameraDevice VERBOSE`
+//   **也救不回来**(那只是运行时过滤)。实测 dump 二进制确认:
+//   "Requested config doesn't match any supported input config" 等三条
+//   ALOGV 字符串在 /system/bin/virtual_camera 里根本不存在。
+//   而 isStreamCombinationSupported 里**大部分拒绝分支都是 ALOGV** ——
+//   于是"配不出会话"在日志里完全是哑的,只能看到 App 3 秒后超时退出。
+//   ⚠️ 这行是**排查用**;它只影响日志量,不改变任何逻辑。
+#define LOG_NDEBUG 0
 #define LOG_TAG "VirtualCameraDevice"
 #include "VirtualCameraDevice.h"
 
