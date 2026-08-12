@@ -124,6 +124,11 @@ cc_test {
         "CameraPermissionsTest.cpp",
         "CameraProviderManagerTest.cpp",
         "SharedSessionConfigUtilsTest.cpp",
+        // ★ 放在**设备侧**而不是 hostsupported:它要链 libcameraservice
+        //   (isStreamUseCaseSupported 在 SessionConfigurationUtils.cpp 里),
+        //   而 hostsupported 那组的 static_libs 里没有 libcameraservice,
+        //   放错地方会以"undefined symbol"链接失败。
+        "StreamUseCaseSupportTest.cpp",
     ],
 
 }

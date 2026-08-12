@@ -460,13 +460,52 @@ bool isStreamUseCaseSupported(int64_t streamUseCase,
     camera_metadata_ro_entry_t availableStreamUseCases =
             deviceInfo.find(ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES);
 
-    if (availableStreamUseCases.count == 0 &&
-            streamUseCase == ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_DEFAULT) {
-        return true;
-    }
+    // ★★ 2026-08-12(ovaltine):设备**完全没声明** use case 列表时,
+    //    上游只放行 DEFAULT(0),其余一律拒 —— 包括 PREVIEW / STILL_CAPTURE
+    //    这些"每台相机本来就在做"的标准用途。
+    //
+    //    本机(SM8475 / 高通 camera provider 2.7)**六台相机全部没有**
+    //    ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES(实测 dumpsys media.camera)。
+    //    而 CameraX 在某些配置下会给流打上 StreamUseCase(value=1/2),于是:
+    //        E cameraserver: Camera 1: stream use case 1 not supported,
+    //                        failed to create output stream
+    //        → CameraCaptureSession 配置失败 → CameraX 3 秒超时
+    //        → Activity finish()(**进程不死**,所以 crash buffer / tombstone /
+    //           dumpsys activity exit-info 全都查不到,表现为"闪退")
+    //
+    //    为什么放行是安全的:use case 本质是**给 HAL 的性能提示**
+    //    (要不要 ZSL、走哪条 ISP 路径)。设备没声明能力表 ⇒ 它不理解这些提示 ⇒
+    //    忽略即可,按普通流处理,画面/功能不受影响。
+    //    反过来硬拒的代价是**整个会话建不起来**,明显更糟。
+    //
+    //    ⚠️ 只在"完全没声明"时放宽。设备**声明了**列表的话,说明它真的懂
+    //    use case,那就必须严格按它声明的来 —— 那种情况下拒绝是对的,
+    //    不能一起放开(否则会把"这台相机明确不支持 VIDEO_CALL"也放过去)。
+    // ⚠️⚠️ 顺序要紧:vendor 区间的判断**必须放在前面**。
+    //   我第一版把下面这个 `count == 0` 的分支写在了 vendor 判断**之前**,
+    //   于是"设备没声明列表 + 请求 vendor use case"会走进 switch 的
+    //   default 分支被拒 —— 把上游"vendor 无条件放行"的行为改坏了。
+    //   ★ 是新加的 vendorUseCasesAlwaysAllowed 用例把它抓出来的
+    //     (我自己读代码没看出来)。
     // Allow vendor stream use case unconditionally.
     if (streamUseCase >= ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_VENDOR_START) {
         return true;
+    }
+
+    if (availableStreamUseCases.count == 0) {
+        switch (streamUseCase) {
+            case ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_DEFAULT:
+            case ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_PREVIEW:
+            case ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_STILL_CAPTURE:
+            case ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_VIDEO_RECORD:
+            case ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_PREVIEW_VIDEO_STILL:
+            case ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_VIDEO_CALL:
+                return true;
+            default:
+                // CROPPED_RAW 等更特殊的用途仍然拒绝:它们会改变**输出内容**
+                // (不只是性能提示),静默忽略会让 App 拿到与预期不符的数据。
+                return false;
+        }
     }
 
     for (size_t i = 0; i < availableStreamUseCases.count; i++) {
