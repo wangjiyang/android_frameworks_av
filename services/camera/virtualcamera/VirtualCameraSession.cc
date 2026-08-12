@@ -32,6 +32,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
@@ -205,16 +206,9 @@ HalStream getHalStream(const Stream& stream) {
   return halStream;
 }
 
-Stream getHighestResolutionStream(const std::vector<Stream>& streams) {
-  return *(std::max_element(streams.begin(), streams.end(),
-                            [](const Stream& a, const Stream& b) {
-                              return a.width * a.height < b.width * b.height;
-                            }));
-}
-
-Resolution resolutionFromStream(const Stream& stream) {
-  return Resolution(stream.width, stream.height);
-}
+// getHighestResolutionStream / resolutionFromStream 已随
+// pickInputConfigurationForStreams 的改写一起删除(2026-08-12):
+// 挑输入档不再只看"最大的那条流",而是看所有流在各维度上的最大值。
 
 Resolution resolutionFromInputConfig(
     const SupportedStreamConfiguration& inputConfig) {
@@ -245,36 +239,76 @@ std::optional<Resolution> resolutionFromSurface(const sp<Surface> surface) {
 std::optional<SupportedStreamConfiguration> pickInputConfigurationForStreams(
     const std::vector<Stream>& requestedStreams,
     const std::vector<SupportedStreamConfiguration>& supportedInputConfigs) {
-  Stream maxResolutionStream = getHighestResolutionStream(requestedStreams);
-  Resolution maxResolution = resolutionFromStream(maxResolutionStream);
+  // ★ 2026-08-12 改动:原来只看**最大那条流**的比例去挑输入档
+  //   (getHighestResolutionStream + 同比例过滤)。会话内允许混比例之后,
+  //   那样挑会漏掉别的流 —— 比如最大流是 1920x1080(16:9),
+  //   挑中 1920x1080 输入档,而同会话里另有一条 1600x1200(4:3) 的流,
+  //   高度 1200 > 1080,只能**放大**,画面糊掉且没有任何报错。
+  //
+  //   现在改成:输入档必须**在两个维度上同时覆盖所有请求流**,
+  //   在此前提下选像素数最小的那个(够用就行,不浪费带宽/显存)。
+  //
+  //   ⚠️ 同样不能用 Resolution::operator< / <=(它比的是像素总数),
+  //      必须逐维度比。理由见 VirtualCameraDevice.cc 里同一处注释。
 
-  // Find best fitting stream to satisfy all requested streams:
-  // Best fitting => same or higher resolution as input with lowest pixel count
-  // difference and same aspect ratio.
-  auto isBetterInputConfig = [maxResolution](
-                                 const SupportedStreamConfiguration& configA,
-                                 const SupportedStreamConfiguration& configB) {
-    int maxResPixelCount = maxResolution.width * maxResolution.height;
-    int pixelCountDiffA =
-        std::abs((configA.width * configA.height) - maxResPixelCount);
-    int pixelCountDiffB =
-        std::abs((configB.width * configB.height) - maxResPixelCount);
+  // 所有流在各维度上的最大值 —— 输入档至少要这么大才能覆盖全部流。
+  int requiredWidth = 0;
+  int requiredHeight = 0;
+  for (const Stream& stream : requestedStreams) {
+    requiredWidth = std::max(requiredWidth, stream.width);
+    requiredHeight = std::max(requiredHeight, stream.height);
+  }
 
-    return pixelCountDiffA < pixelCountDiffB;
+  // ★ 打分:**先看比例接近程度,再看面积**(2026-08-12 review 后改良)。
+  //   只按"面积最小"挑会选到裁剪损失更大的那档。例:App 只要一条
+  //   320x180(16:9),而我们有 1440x1080(4:3) 和 1920x1080(16:9) 两档 ——
+  //   面积最小的是 4:3 那档,可它要裁掉左右 25%,白白丢掉水平信息;
+  //   16:9 那档一刀不用裁。所以"最小"不等于"最好",要按畸变损失排。
+  //
+  //   比例用**最大请求流**的比例当参照(那条流的画质最要紧)。
+  int refWidth = 0;
+  int refHeight = 0;
+  int refPixels = -1;
+  for (const Stream& stream : requestedStreams) {
+    const int pixels = stream.width * stream.height;
+    if (pixels > refPixels) {
+      refPixels = pixels;
+      refWidth = stream.width;
+      refHeight = stream.height;
+    }
+  }
+  const float refAspect =
+      (refHeight > 0) ? static_cast<float>(refWidth) / refHeight : 0.f;
+
+  auto aspectPenalty = [refAspect](const SupportedStreamConfiguration& c) {
+    if (c.height <= 0 || refAspect <= 0.f) {
+      return 0.f;
+    }
+    return std::abs(static_cast<float>(c.width) / c.height - refAspect);
   };
 
   std::optional<SupportedStreamConfiguration> bestConfig;
   for (const SupportedStreamConfiguration& inputConfig : supportedInputConfigs) {
-    Resolution inputConfigResolution = resolutionFromInputConfig(inputConfig);
-    if (inputConfigResolution < maxResolution ||
-        !isApproximatellySameAspectRatio(inputConfigResolution, maxResolution)) {
-      // We don't want to upscale from lower resolution, or use different aspect
-      // ratio, skip.
+    if (inputConfig.width < requiredWidth ||
+        inputConfig.height < requiredHeight) {
+      // 覆盖不了(至少一个维度不够),会导致放大,跳过。
       continue;
     }
 
-    if (!bestConfig.has_value() ||
-        isBetterInputConfig(inputConfig, bestConfig.value())) {
+    if (!bestConfig.has_value()) {
+      bestConfig = inputConfig;
+      continue;
+    }
+
+    const float candidatePenalty = aspectPenalty(inputConfig);
+    const float bestPenalty = aspectPenalty(*bestConfig);
+    // 比例差距在 epsilon 之内视为"一样好",此时再比面积(取小的,省显存/带宽)。
+    constexpr float kAspectTieEpsilon = 0.01f;
+    if (candidatePenalty < bestPenalty - kAspectTieEpsilon) {
+      bestConfig = inputConfig;
+    } else if (std::abs(candidatePenalty - bestPenalty) <= kAspectTieEpsilon &&
+               (inputConfig.width * inputConfig.height) <
+                   (bestConfig->width * bestConfig->height)) {
       bestConfig = inputConfig;
     }
   }
@@ -430,11 +464,22 @@ ndk::ScopedAStatus VirtualCameraSession::configureStreams(
         mVirtualCameraClientCallback->onStreamClosed(mCurrentInputStreamId);
       }
 
+      // ⚠️ 这里**不能**直接解引用 currentInputResolution:走到这一行有两种
+      //   可能,其中一种是上面的 `has_value()` 为 false 而短路下来的
+      //   ⇒ 空 optional 解引用 = UB(上游既有 bug,2026-08-12 review 抓出)。
+      //   混比例之后 render thread 重建更频繁,这条路径也就更常走。
+      //
+      // ★ 用具名变量而不是在 ALOGV 实参里现拼字符串:那样临时 std::string
+      //   会在取完 .c_str() 后**立刻析构**,ALOGV 拿到的是悬垂指针。
+      const std::string currentResolutionStr =
+          currentInputResolution.has_value()
+              ? std::to_string(currentInputResolution->width) + "x" +
+                    std::to_string(currentInputResolution->height)
+              : std::string("unknown");
       ALOGV(
           "%s: Newly requested output streams are not suitable for "
-          "pre-existing surface (%dx%d), creating new surface (%dx%d)",
-          __func__, currentInputResolution->width,
-          currentInputResolution->height, inputConfig->width,
+          "pre-existing surface (%s), creating new surface (%dx%d)",
+          __func__, currentResolutionStr.c_str(), inputConfig->width,
           inputConfig->height);
 
       mRenderThread->flush();

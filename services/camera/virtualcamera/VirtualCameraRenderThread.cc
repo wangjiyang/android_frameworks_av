@@ -787,9 +787,9 @@ std::vector<uint8_t> VirtualCameraRenderThread::createThumbnail(
     return {};
   }
 
-  // TODO(b/324383963) Add support for letterboxing if the thumbnail sizese
-  // doesn't correspond
-  //  to input texture aspect ratio.
+  // 缩略图比例与输入纹理不一致时,由 renderIntoEglFramebuffer 里的中心裁剪
+  // 处理(2026-08-12),不会再变形 —— 原 TODO(b/324383963) 的 letterbox
+  // 方案不需要了(裁剪比加黑边更贴近真实相机的行为)。
   if (!renderIntoEglFramebuffer(*framebuffer, /*fence=*/nullptr,
                                 Rect(resolution.width, resolution.height))
            .isOk()) {
@@ -965,14 +965,29 @@ ndk::ScopedAStatus VirtualCameraRenderThread::renderIntoEglFramebuffer(
     glClearColor(0.0f, 0.5f, 0.5f, 0.0f);
     glClear(GL_COLOR_BUFFER_BIT);
   } else {
+    // ★ 中心裁剪(2026-08-12):着色器会把整张输入纹理拉伸铺满 viewport,
+    //   所以输入和输出比例不同时必须先在纹理坐标上裁一刀,否则画面变形。
+    //   有了它,一个会话里才可以同时存在 4:3 和 16:9 的输出流。
+    //
+    //   viewportRect 就是这条流真正要的尺寸(调用方已经按流的 width/height
+    //   传进来了),拿它当裁剪目标即可 —— 不能用 framebuffer 的尺寸,
+    //   BLOB 路径下 framebuffer 被 roundTo2DctSize 放大过,用它会裁错。
+    //
+    //   同比例时 createCenterCropTransform 返回**严格的单位矩阵**
+    //   (有单元测试钉着),所以原有的同比例路径逐像素不变。
+    const std::array<float, 16> cropMatrix = createCenterCropTransform(
+        mInputSurfaceSize,
+        Resolution(viewportRect.getWidth(), viewportRect.getHeight()));
+    // 顺序:先按 SurfaceTexture 自己的矩阵摆正(朝向/y 翻转),再裁剪 ⇒ 裁剪在外层。
+    const std::array<float, 16> textureMatrix = composeTransforms(
+        cropMatrix, mEglSurfaceTexture->getTransformMatrix());
+
     const bool renderSuccess =
         isYuvFormat(static_cast<PixelFormat>(textureBuffer->getPixelFormat()))
-            ? mEglTextureYuvProgram->draw(
-                  mEglSurfaceTexture->getTextureId(),
-                  mEglSurfaceTexture->getTransformMatrix())
-            : mEglTextureRgbProgram->draw(
-                  mEglSurfaceTexture->getTextureId(),
-                  mEglSurfaceTexture->getTransformMatrix());
+            ? mEglTextureYuvProgram->draw(mEglSurfaceTexture->getTextureId(),
+                                          textureMatrix)
+            : mEglTextureRgbProgram->draw(mEglSurfaceTexture->getTextureId(),
+                                          textureMatrix);
     if (!renderSuccess) {
       ALOGE("%s: Failed to render texture", __func__);
       return cameraStatus(Status::INTERNAL_ERROR);

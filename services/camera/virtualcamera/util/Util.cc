@@ -152,6 +152,76 @@ bool isFormatSupportedForInput(const int width, const int height,
   return true;
 }
 
+std::array<float, 16> createCenterCropTransform(const Resolution input,
+                                                const Resolution output) {
+  // Identity by default — also the safe fallback for degenerate input.
+  std::array<float, 16> m{1.f, 0.f, 0.f, 0.f,   //
+                          0.f, 1.f, 0.f, 0.f,   //
+                          0.f, 0.f, 1.f, 0.f,   //
+                          0.f, 0.f, 0.f, 1.f};  //
+
+  if (input.width <= 0 || input.height <= 0 || output.width <= 0 ||
+      output.height <= 0) {
+    // Nothing sensible to compute; identity keeps the previous behaviour
+    // rather than producing a NaN matrix that would render garbage.
+    return m;
+  }
+
+  const float inputAspect =
+      static_cast<float>(input.width) / static_cast<float>(input.height);
+  const float outputAspect =
+      static_cast<float>(output.width) / static_cast<float>(output.height);
+
+  // scaleX/scaleY are the fraction of the input texture we keep along each
+  // axis. We only ever crop (scale <= 1), never pad, so the output is always
+  // fully covered by image data (no black bars).
+  float scaleX = 1.f;
+  float scaleY = 1.f;
+  if (inputAspect > outputAspect) {
+    // Input is wider than output (e.g. 16:9 source -> 4:3 stream):
+    // keep full height, crop the sides.
+    scaleX = outputAspect / inputAspect;
+  } else if (inputAspect < outputAspect) {
+    // Input is taller than output (e.g. 4:3 source -> 16:9 stream):
+    // keep full width, crop top and bottom.
+    scaleY = inputAspect / outputAspect;
+  }
+
+  // Texture coordinates are in [0,1]; centering the kept region means
+  // offsetting by half of what we removed.
+  const float offsetX = (1.f - scaleX) / 2.f;
+  const float offsetY = (1.f - scaleY) / 2.f;
+
+  // Column-major 4x4 (same convention as SurfaceTexture's matrix and what
+  // glUniformMatrix4fv consumes with transpose=GL_FALSE):
+  //   [ sx  0  0  0 ]
+  //   [  0 sy  0  0 ]
+  //   [  0  0  1  0 ]
+  //   [ tx ty  0  1 ]
+  m[0] = scaleX;
+  m[5] = scaleY;
+  m[12] = offsetX;
+  m[13] = offsetY;
+  return m;
+}
+
+std::array<float, 16> composeTransforms(const std::array<float, 16>& outer,
+                                        const std::array<float, 16>& inner) {
+  // Column-major multiply: result = outer * inner.
+  // Element (row, col) of a column-major matrix M lives at M[col * 4 + row].
+  std::array<float, 16> result{};
+  for (int col = 0; col < 4; ++col) {
+    for (int row = 0; row < 4; ++row) {
+      float sum = 0.f;
+      for (int k = 0; k < 4; ++k) {
+        sum += outer[k * 4 + row] * inner[col * 4 + k];
+      }
+      result[col * 4 + row] = sum;
+    }
+  }
+  return result;
+}
+
 std::ostream& operator<<(std::ostream& os, const Resolution& resolution) {
   return os << resolution.width << "x" << resolution.height;
 }

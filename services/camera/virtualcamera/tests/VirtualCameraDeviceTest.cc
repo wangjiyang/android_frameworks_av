@@ -190,6 +190,22 @@ INSTANTIATE_TEST_SUITE_P(
                      .width = kQvgaWidth,
                      .height = kQvgaHeight,
                      .pixelFormat = ANDROID_SCALER_AVAILABLE_FORMATS_BLOB},
+                 // ★ 2026-08-12 新增:640x360(16:9)现在也能从 VGA(4:3)
+                 //   输入中心裁剪出来 ⇒ 进能力表。改动前因"比例不同"被排除。
+                 AvailableStreamConfiguration{
+                     .width = 640,
+                     .height = 360,
+                     .pixelFormat =
+                         ANDROID_SCALER_AVAILABLE_FORMATS_YCbCr_420_888},
+                 AvailableStreamConfiguration{
+                     .width = 640,
+                     .height = 360,
+                     .pixelFormat =
+                         ANDROID_SCALER_AVAILABLE_FORMATS_IMPLEMENTATION_DEFINED},
+                 AvailableStreamConfiguration{
+                     .width = 640,
+                     .height = 360,
+                     .pixelFormat = ANDROID_SCALER_AVAILABLE_FORMATS_BLOB},
                  AvailableStreamConfiguration{
                      .width = kVgaWidth,
                      .height = kVgaHeight,
@@ -260,6 +276,49 @@ INSTANTIATE_TEST_SUITE_P(
                 AvailableStreamConfiguration{
                     .width = kVgaWidth,
                     .height = kVgaHeight,
+                    .pixelFormat = ANDROID_SCALER_AVAILABLE_FORMATS_BLOB},
+                // ★ 2026-08-12 新增:720x480 / 720x576 / 800x600 都能从
+                //   1280x720 输入逐维度装下 ⇒ 中心裁剪可达 ⇒ 进能力表。
+                //   改动前它们的比例(3:2 / 5:4 / 4:3)与任何输入档都不同,
+                //   被"同比例"那条排除掉了。
+                AvailableStreamConfiguration{
+                    .width = 720,
+                    .height = 480,
+                    .pixelFormat = ANDROID_SCALER_AVAILABLE_FORMATS_YCbCr_420_888},
+                AvailableStreamConfiguration{
+                    .width = 720,
+                    .height = 480,
+                    .pixelFormat =
+                        ANDROID_SCALER_AVAILABLE_FORMATS_IMPLEMENTATION_DEFINED},
+                AvailableStreamConfiguration{
+                    .width = 720,
+                    .height = 480,
+                    .pixelFormat = ANDROID_SCALER_AVAILABLE_FORMATS_BLOB},
+                AvailableStreamConfiguration{
+                    .width = 720,
+                    .height = 576,
+                    .pixelFormat = ANDROID_SCALER_AVAILABLE_FORMATS_YCbCr_420_888},
+                AvailableStreamConfiguration{
+                    .width = 720,
+                    .height = 576,
+                    .pixelFormat =
+                        ANDROID_SCALER_AVAILABLE_FORMATS_IMPLEMENTATION_DEFINED},
+                AvailableStreamConfiguration{
+                    .width = 720,
+                    .height = 576,
+                    .pixelFormat = ANDROID_SCALER_AVAILABLE_FORMATS_BLOB},
+                AvailableStreamConfiguration{
+                    .width = 800,
+                    .height = 600,
+                    .pixelFormat = ANDROID_SCALER_AVAILABLE_FORMATS_YCbCr_420_888},
+                AvailableStreamConfiguration{
+                    .width = 800,
+                    .height = 600,
+                    .pixelFormat =
+                        ANDROID_SCALER_AVAILABLE_FORMATS_IMPLEMENTATION_DEFINED},
+                AvailableStreamConfiguration{
+                    .width = 800,
+                    .height = 600,
                     .pixelFormat = ANDROID_SCALER_AVAILABLE_FORMATS_BLOB},
                 AvailableStreamConfiguration{
                     .width = 1024,
@@ -351,14 +410,20 @@ TEST_F(VirtualCameraDeviceTest, configureTooManyStallStreamsFails) {
   EXPECT_FALSE(aidl_ret);
 }
 
-TEST_F(VirtualCameraDeviceTest, thumbnailSizeWithCompatibleAspectRatio) {
+// ★ 原名 thumbnailSizeWithCompatibleAspectRatio —— 现在断言的恰恰是
+//   "**不**同比例的缩略图尺寸也支持",旧名字会误导人以为比例检查还在。
+TEST_F(VirtualCameraDeviceTest, thumbnailSizesFittingWithinInput) {
   CameraMetadata metadata;
   ASSERT_TRUE(mCamera->getCameraCharacteristics(&metadata).isOk());
 
-  // Camera is configured with VGA input, we expect 240 x 180 thumbnail size in
-  // characteristics, since it has same aspect ratio.
+  // ★ 2026-08-12:原来只期望 240x180(唯一与 VGA 同比例的那个)。
+  //   缩略图渲染路径现在会中心裁剪 ⇒ 判据从"同比例"变成"逐维度装得下",
+  //   于是全部 5 个标准尺寸(都 ≤ 640x480)都被支持。
+  //   顺序跟着 kStandardJpegThumbnailSizes 的声明顺序走。
   EXPECT_THAT(getJpegAvailableThumbnailSizes(metadata),
-              ElementsAre(Resolution(0, 0), Resolution(240, 180)));
+              ElementsAre(Resolution(0, 0), Resolution(176, 144),
+                          Resolution(240, 144), Resolution(256, 144),
+                          Resolution(240, 160), Resolution(240, 180)));
 }
 
 TEST_F(VirtualCameraDeviceTest, dump) {

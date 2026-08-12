@@ -17,6 +17,7 @@
 #ifndef ANDROID_COMPANION_VIRTUALCAMERA_UTIL_H
 #define ANDROID_COMPANION_VIRTUALCAMERA_UTIL_H
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -179,6 +180,53 @@ inline bool isApproximatellySameAspectRatio(const Resolution r1,
 
   return std::abs(aspectRatio1 - aspectRatio2) < kAspectRatioEpsilon;
 }
+
+// Returns a texture-coordinate transform matrix (column-major, as consumed by
+// EglTextureProgram::draw) that center-crops an input texture of resolution
+// `input` so that it can be rendered into an output of resolution `output`
+// *without distortion*.
+//
+// ★ 为什么需要这个(2026-08-12):
+//   渲染路径是"把整张输入纹理拉伸铺满 viewport"(见 EglProgram.h:61 的注释
+//   "Shader stretches the texture over the viewport"),所以一旦输入和输出
+//   比例不同,画面就会被拉变形。这正是 HAL 原本无条件要求"会话内所有流同比例"
+//   的根本原因 —— 那条限制是渲染能力的产物,不是协议的要求。
+//   有了中心裁剪,不同比例就能共存:16:9 的输入给 4:3 的流时裁掉左右两边,
+//   反之裁掉上下。
+//
+// 语义上这也是对的:真实相机的传感器是固定比例的,App 要 4:3 时相机 HAL
+// 同样是从传感器上裁一块出来(ANDROID_SCALER_CROP_REGION),不会去拉伸。
+//
+// The returned matrix must be *pre-multiplied* onto the SurfaceTexture's own
+// transform matrix (which handles buffer orientation / y-flip), never used on
+// its own — see composeTransforms below.
+std::array<float, 16> createCenterCropTransform(Resolution input,
+                                                Resolution output);
+
+// Returns the matrix product `outer * inner` for two column-major 4x4
+// matrices.
+//
+// 用法:M = composeTransforms(crop, surfaceTransform),即裁剪在**外层**。
+// 着色器算的是 `texCoord = M * vec4(s,t,0,1)`。
+//
+// ⚠️⚠️ 已知局限:**含 90°/270° 旋转时裁剪会作用在错误的轴上**。
+//   createCenterCropTransform 只拿得到**未旋转的 buffer 尺寸**
+//   (mInputSurfaceSize),它无从得知 SurfaceTexture 的 transform 会不会把
+//   宽高轴对调。所以 transform 一旦含 ROT_90/ROT_270,"收窄宽度"这个意图
+//   经旋转后会落到输出的**高度**方向上 —— 裁错边 + 残留变形。
+//
+//   ★ 这**不是**换个复合顺序能修好的,是**缺信息**:两种顺序都错,
+//     只是错的方向不同。真要支持旋转,得先从 transform 里解出旋转角、
+//     把 input 的宽高对调后再算裁剪。
+//
+//   为什么现在不修:当前链路的生产者(MediaCodec → Surface)**不调**
+//   `setBuffersTransform`,transform 是单位阵,不触发这条路径。
+//   贸然加"解旋转"的代码反而是没有判据的复杂度。
+//   ⇒ 留作已知边界,并由 tests/UtilTest.cc 里
+//     `cropIsComputedInUnrotatedBufferSpace` 把"单位阵前提"钉死:
+//     将来谁引入带旋转的生产者,会先撞到那条用例而不是对着画面猜。
+std::array<float, 16> composeTransforms(const std::array<float, 16>& outer,
+                                        const std::array<float, 16>& inner);
 
 std::ostream& operator<<(std::ostream& os, const Resolution& resolution);
 

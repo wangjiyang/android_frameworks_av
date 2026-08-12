@@ -403,7 +403,16 @@ TEST_F(VirtualCameraSessionTest, ConfigureWithEmptyStreams) {
       Eq(static_cast<int32_t>(Status::ILLEGAL_ARGUMENT)));
 }
 
-TEST_F(VirtualCameraSessionTest, ConfigureWithDifferentAspectRatioFails) {
+// A stream that doesn't fit within the input config in *both* dimensions is
+// still rejected — 480x640 (portrait) needs 640 rows while the VGA input only
+// has 480, so it cannot be produced by cropping.
+//
+// ★ 2026-08-12:这个用例原名 ConfigureWithDifferentAspectRatioFails,
+//   断言的是"比例不同就拒"。渲染器支持中心裁剪之后,比例不同**本身**不再是
+//   拒绝的理由,真正的判据变成"输入档能不能在两个维度上覆盖这条流"。
+//   这里的 480x640 两条都仍然该拒,但**理由变了** —— 用例名和注释跟着改,
+//   免得以后有人看着旧名字以为"比例检查还在"。
+TEST_F(VirtualCameraSessionTest, ConfigureWithStreamExceedingInputHeightFails) {
   StreamConfiguration streamConfiguration;
   streamConfiguration.streams = {
       createStream(kStreamId, kVgaWidth, kVgaHeight, PixelFormat::YCBCR_420_888),
@@ -417,6 +426,26 @@ TEST_F(VirtualCameraSessionTest, ConfigureWithDifferentAspectRatioFails) {
       mVirtualCameraSession->configureStreams(streamConfiguration, &halStreams)
           .getServiceSpecificError(),
       Eq(static_cast<int32_t>(Status::ILLEGAL_ARGUMENT)));
+}
+
+// ★ 新增(2026-08-12):混比例但**都装得下**的会话现在必须成功。
+//   这条是本次改动的核心收益 —— 相机 App 进 VIDEO 模式时正是这个形状:
+//   一条 16:9 的主流 + 一条 4:3 的分析小流。
+//   (没有这条正向用例,上面那条"仍然拒绝"单独看会让人以为什么都没变。)
+TEST_F(VirtualCameraSessionTest, ConfigureMixedAspectRatioWithinInputSucceeds) {
+  StreamConfiguration streamConfiguration;
+  streamConfiguration.streams = {
+      // 4:3, fits within the VGA (640x480) input exactly.
+      createStream(kStreamId, kVgaWidth, kVgaHeight, PixelFormat::YCBCR_420_888),
+      // 16:9-ish smaller stream: 320x180 fits within 640x480 in both dims.
+      createStream(kSecondStreamId, 320, 180, PixelFormat::YCBCR_420_888)};
+
+  std::vector<HalStream> halStreams;
+
+  EXPECT_TRUE(
+      mVirtualCameraSession->configureStreams(streamConfiguration, &halStreams)
+          .isOk());
+  EXPECT_THAT(halStreams.size(), Eq(2));
 }
 
 // Input Choice Virtual Camera Session Tests

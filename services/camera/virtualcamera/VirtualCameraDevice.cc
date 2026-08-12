@@ -109,8 +109,9 @@ const std::array<PixelFormat, 3> kOutputFormats{
     PixelFormat::BLOB};
 
 // The resolutions below will used to extend the set of supported output formats.
-// All resolutions with lower pixel count and same aspect ratio as some supported
-// input resolution will be added to the set of supported output resolutions.
+// Any resolution that fits within some supported input resolution in *both*
+// dimensions is added to the set of supported output resolutions; a differing
+// aspect ratio is handled by center-cropping at render time.
 const std::array<Resolution, 10> kOutputResolutions{
     Resolution(320, 240),   Resolution(640, 360),  Resolution(640, 480),
     Resolution(720, 480),   Resolution(720, 576),  Resolution(800, 600),
@@ -120,13 +121,17 @@ const std::array<Resolution, 10> kOutputResolutions{
 
 std::vector<Resolution> getSupportedJpegThumbnailSizes(
     const std::vector<SupportedStreamConfiguration>& configs) {
+  // ★ 2026-08-12:同样从"同比例"放宽到"逐维度装得下"。
+  //   缩略图路径本来就走 renderIntoEglFramebuffer(带 viewport),
+  //   现在那条路径会中心裁剪,所以非同比例的缩略图尺寸也能正确产出
+  //   (顺带解决了这里原本的 TODO b/324383963 —— 不再需要 letterbox)。
   auto isSupportedByAnyInputConfig =
       [&configs](const Resolution thumbnailResolution) {
         return std::any_of(
             configs.begin(), configs.end(),
             [thumbnailResolution](const SupportedStreamConfiguration& config) {
-              return isApproximatellySameAspectRatio(
-                  thumbnailResolution, Resolution(config.width, config.height));
+              return thumbnailResolution.width <= config.width &&
+                     thumbnailResolution.height <= config.height;
             });
       };
 
@@ -169,18 +174,42 @@ std::vector<FpsRange> fpsRangesForInputConfig(
 
 std::optional<Resolution> getMaxResolution(
     const std::vector<SupportedStreamConfiguration>& configs) {
-  auto itMax = std::max_element(configs.begin(), configs.end(),
-                                [](const SupportedStreamConfiguration& a,
-                                   const SupportedStreamConfiguration& b) {
-                                  return a.width * b.height < a.width * b.height;
-                                });
-  if (itMax == configs.end()) {
+  if (configs.empty()) {
     ALOGE(
         "%s: empty vector of supported configurations, cannot find largest "
         "resolution.",
         __func__);
     return std::nullopt;
   }
+
+  // ★★ 这里原来是上游 AOSP 的一个 bug(2026-08-12 发现并修):
+  //      return a.width * b.height < a.width * b.height;
+  //    左右两边**完全一样**(都是 a.width * b.height)⇒ 恒为 false
+  //    ⇒ max_element 永远返回第一个元素,不是最大的那个。
+  //    (正确写法应是 a.width * a.height < b.width * b.height。)
+  //
+  //    以前所有输入档都同比例、且通常只有一档,所以"取第一个"碰巧没出事。
+  //    现在我们要同时声明 16:9 和 4:3 两档,它就会真的报错值。
+  //
+  // ★★ 为什么**不**返回"逐维度包围盒"(我第一版就是那么写的,被 review 否掉):
+  //    这个值会被当成虚拟相机的传感器尺寸
+  //    (SENSOR_INFO_ACTIVE_ARRAY_SIZE / getMaxInputResolution),
+  //    而 VirtualCameraCaptureResult.cc 里的 crop region 是**硬编码**成
+  //    (0, 0, sensorW, sensorH) 的 —— 每帧都声称"我用满了整个 active array"。
+  //
+  //    包围盒可能是一个**根本不存在的分辨率**:
+  //      16:9=1920x1080 与 4:3=1600x1200 ⇒ 包围盒 1920x1200,
+  //      而任何一路输入 Surface 都不是这个尺寸 ⇒ 那些像素**不存在**。
+  //    App 拿 crop region 去反算人脸框 / 点击对焦坐标就会系统性偏移,
+  //    而且**画面本身看着是正常的**,极难定位。
+  //
+  //    ⇒ 取"面积最大的那一档**真实存在的**输入档",保证 active array
+  //      永远对应一个真的能采到的尺寸,App 侧的换算至少自洽。
+  auto itMax = std::max_element(configs.begin(), configs.end(),
+                                [](const SupportedStreamConfiguration& a,
+                                   const SupportedStreamConfiguration& b) {
+                                  return a.width * a.height < b.width * b.height;
+                                });
 
   return Resolution(itMax->width, itMax->height);
 }
@@ -212,17 +241,40 @@ std::map<Resolution, int> getResolutionToMaxFpsMap(
         continue;
       }
 
-      if (outputResolution < resolution &&
-          isApproximatellySameAspectRatio(outputResolution, resolution)) {
-        // Lower resolution with same aspect ratio, we can achieve this by
-        // downscaling, let's add it to the map.
-        ALOGD(
-            "Extending set of output resolutions with %dx%d which has same "
-            "aspect ratio as supported input %dx%d.",
-            outputResolution.width, outputResolution.height, resolution.width,
-            resolution.height);
-        additionalResolutionToMaxFpsMap[outputResolution] = maxFps;
-        break;
+      // ★ 2026-08-12:原来要求"同比例"才把这个输出档广播出去。
+      //   这一处是**决定性的** —— 前面两道检查放开了,但如果这里不放开,
+      //   相机 App 在能力表里根本看不到 4:3 的尺寸,也就永远不会去请求它,
+      //   整个改动等于没做(而且看上去"没报错",极具迷惑性)。
+      //
+      //   现在渲染器能中心裁剪,只要输入档在**两个维度上都够大**,
+      //   就能裁+缩出这个输出档 ⇒ 按逐维度覆盖来判定。
+      //
+      //   ⚠️ 仍然不能用 operator<(它比像素总数),必须逐维度比:
+      //      1280x1080 的像素数比 1920x1080 少,但宽度要求一样、
+      //      高度更高,从 1920x1080 裁不出来。
+      if (outputResolution.width <= resolution.width &&
+          outputResolution.height <= resolution.height &&
+          !(outputResolution == resolution)) {
+        // Lower-or-equal resolution in both dimensions: reachable by
+        // center-cropping and/or downscaling the input.
+        //
+        // ★ 不能在这里 break(2026-08-12 review 抓出):
+        //   break 会让结果取"**第一个**能覆盖的输入档"的 maxFps,
+        //   而 resolutionToMaxFpsMap 是按像素数排序的 std::map ⇒
+        //   拿到的是像素数最小那档的 fps。若两档 fps 不同
+        //   (如 4:3 档 30fps、16:9 档 60fps),广播出去的 fps 会**偏低**,
+        //   App 就看不到本来支持的高帧率。改成扫完所有档取 max。
+        auto it = additionalResolutionToMaxFpsMap.find(outputResolution);
+        if (it == additionalResolutionToMaxFpsMap.end()) {
+          ALOGD(
+              "Extending set of output resolutions with %dx%d (fits within "
+              "supported input %dx%d; center-crop handles aspect difference).",
+              outputResolution.width, outputResolution.height, resolution.width,
+              resolution.height);
+          additionalResolutionToMaxFpsMap[outputResolution] = maxFps;
+        } else {
+          it->second = std::max(it->second, maxFps);
+        }
       }
     }
   }
@@ -247,8 +299,9 @@ status_t convertSupportedStreams(
   maxResolution.width = resolution.value().width;
   maxResolution.height = resolution.value().height;
 
-  // TODO(b/301023410) Add also all "standard" resolutions we can rescale the
-  // streams to (all standard resolutions with same aspect ratio).
+  // Standard resolutions we can rescale/crop the streams to are added below
+  // (see kOutputResolutions) — no longer restricted to matching aspect ratios
+  // now that the render path center-crops.
 
   std::map<Resolution, int> resolutionToMaxFpsMap =
       getResolutionToMaxFpsMap(supportedInputConfig);
@@ -642,19 +695,20 @@ bool VirtualCameraDevice::isStreamCombinationSupported(
 
   const std::vector<Stream>& streams = streamConfiguration.streams;
 
-  Resolution firstStreamResolution(streams[0].width, streams[0].height);
-  auto isSameAspectRatioAsFirst = [firstStreamResolution](const Stream& stream) {
-    return isApproximatellySameAspectRatio(
-        firstStreamResolution, Resolution(stream.width, stream.height));
-  };
-  if (!std::all_of(streams.begin(), streams.end(), isSameAspectRatioAsFirst)) {
-    ALOGW(
-        "%s: Requested streams do not have same aspect ratio. Different aspect "
-        "ratios are currently "
-        "not supported by virtual camera. Stream configuration: %s",
-        __func__, streamConfiguration.toString().c_str());
-    return false;
-  }
+  // ★ 2026-08-12:原来这里要求"会话内所有流必须同比例",否则直接拒。
+  //   那条限制的真正来源是渲染器 —— 着色器把整张输入纹理拉伸铺满 viewport
+  //   (EglProgram.h:61),比例不同就会变形,所以只能一刀切禁掉。
+  //
+  //   现在渲染路径已经支持**中心裁剪**(见 renderIntoEglFramebuffer 里的
+  //   createCenterCropTransform),不同比例的流可以从同一张输入纹理上各自
+  //   裁出自己要的那块,不再变形 ⇒ 这条检查可以去掉。
+  //
+  //   为什么这很重要:相机 App(CameraX)在进 VIDEO 模式 / 用倍率控件时,
+  //   会在**同一个会话**里同时要 4:3 的分析小流和 16:9 的录像流。
+  //   老逻辑下整个会话被拒 → App 等 3 秒超时 → Activity 自己 finish
+  //   (表现为"闪退",但进程不死、无 crash 记录,极难定位)。
+  //
+  //   剩下的约束交给下面的逐流检查:每条流仍必须能从某个输入档裁出来。
 
   int numberOfProcessedStreams = 0;
   int numberOfStallStreams = 0;
@@ -679,12 +733,18 @@ bool VirtualCameraDevice::isStreamCombinationSupported(
     }
 
     Resolution requestedResolution(stream.width, stream.height);
+    // ★ 与上面同一个改动(2026-08-12):不再要求"流和输入档同比例",
+    //   改成"输入档在**两个维度上都够大**,能中心裁剪出这条流"。
+    //
+    //   ⚠️ 判据必须逐维度比,不能用 Resolution::operator<=。
+    //      那个 operator 比的是**像素总数**(Util.h:133),
+    //      1920x1080(2.07M) 覆盖不了 1600x1200(1.92M) —— 像素数更少
+    //      但高度更高,裁不出来,而 operator<= 会说"可以",
+    //      于是配置通过、渲染时上下被拉伸。这种错**画面上很难一眼看出**。
     auto matchesSupportedInputConfig =
         [requestedResolution](const SupportedStreamConfiguration& config) {
-          Resolution supportedInputResolution(config.width, config.height);
-          return requestedResolution <= supportedInputResolution &&
-                 isApproximatellySameAspectRatio(requestedResolution,
-                                                 supportedInputResolution);
+          return requestedResolution.width <= config.width &&
+                 requestedResolution.height <= config.height;
         };
     if (std::none_of(mSupportedInputConfigurations.begin(),
                      mSupportedInputConfigurations.end(),
