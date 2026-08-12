@@ -53,6 +53,15 @@ class VirtualCameraService
       const std::string& cameraId, int32_t deviceId, bool* _aidl_return)
       EXCLUDES(mLock);
 
+  // [AGENTOS_STABLE_CAMERA_ID] Register camera with a caller-chosen, stable id.
+  // AIDL entry point; see IVirtualCameraService.aidl for why this exists.
+  ndk::ScopedAStatus registerCameraWithId(
+      const ::ndk::SpAIBinder& token,
+      const ::aidl::android::companion::virtualcamera::VirtualCameraConfiguration&
+          configuration,
+      const std::string& cameraId, int32_t deviceId, bool* _aidl_return)
+      override EXCLUDES(mLock);
+
   // Unregisters camera corresponding to the binder token.
   ndk::ScopedAStatus unregisterCamera(const ::ndk::SpAIBinder& token) override
       EXCLUDES(mLock);

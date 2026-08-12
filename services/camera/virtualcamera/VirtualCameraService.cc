@@ -277,6 +277,17 @@ ndk::ScopedAStatus VirtualCameraService::registerCamera(
                                _aidl_return);
 }
 
+// [AGENTOS_STABLE_CAMERA_ID] 见 IVirtualCameraService.aidl 里的长注释。
+// 调用方指定 id → 每次会话注册成同一个 id → App 记住的 id 不会失效。
+// ★ 直接转调上面那个**已有**的重载:权限检查(kCreateVirtualDevicePermission)
+//   在那里做,不能绕过 —— 这个新入口不放宽任何权限,只多接一个 id 参数。
+ndk::ScopedAStatus VirtualCameraService::registerCameraWithId(
+    const ::ndk::SpAIBinder& token,
+    const VirtualCameraConfiguration& configuration,
+    const std::string& cameraId, const int32_t deviceId, bool* _aidl_return) {
+  return registerCamera(token, configuration, cameraId, deviceId, _aidl_return);
+}
+
 ndk::ScopedAStatus VirtualCameraService::registerCameraNoCheck(
     const ::ndk::SpAIBinder& token,
     const VirtualCameraConfiguration& configuration,
