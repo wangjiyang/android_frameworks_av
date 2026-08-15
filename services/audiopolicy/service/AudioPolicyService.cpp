@@ -968,7 +968,13 @@ void AudioPolicyService::updateUidStates_l()
         bool isAccessibility = mUidPolicy->isA11yUid(currentUid);
         // Clients capturing for Accessibility services or virtual sources are not considered
         // for top or latest active to avoid masking regular clients started before
-        if (!isAccessibility && !isVirtualSource(current->attributes.source)) {
+        // [AGENTOS] Service uids (< AID_APP_START) join the same exclusion: UidPolicy
+        // pins them to PROCESS_STATE_TOP forever, so a long-lived platform capture
+        // (e.g. system_server's remote-assist uplink) would otherwise own topActive
+        // permanently and silence every regular app recording for the whole session.
+        // They are explicitly allowed below instead of competing here.
+        if (!isAccessibility && !isVirtualSource(current->attributes.source)
+                && !isServiceUid(currentUid)) {
             bool isAssistant = mUidPolicy->isAssistantUid(currentUid);
             bool isActiveAssistant = mUidPolicy->isActiveAssistantUid(currentUid);
             bool isPrivacySensitive =
@@ -1122,6 +1128,11 @@ void AudioPolicyService::updateUidStates_l()
             allowCapture = false;
         } else if (isVirtualSource(source)) {
             // Allow capture for virtual (remote submix, call audio TX or RX...) sources
+            allowCapture = true;
+        } else if (isServiceUid(currentUid)) {
+            // [AGENTOS] Service uid captures are deliberate platform features; they are
+            // excluded from top/latest competition above (so they never starve app
+            // captures) and never starved by app concurrency rules themselves.
             allowCapture = true;
         } else if (!useActiveAssistantList && mUidPolicy->isAssistantUid(currentUid)) {
             // For assistant allow capture if:
