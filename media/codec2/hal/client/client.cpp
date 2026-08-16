@@ -257,9 +257,21 @@ public:
         if (!mClient) {
             mClient = Codec2Client::_CreateFromIndex(mIndex);
         }
-        CHECK(mClient) << "Failed to create Codec2Client to service \""
+        // ★★ 2026-08-16:这里原本是 `CHECK(mClient) << ...`,拿不到就 abort。
+        //   配合下面 _CreateFromIndex 的改动一起看:那边改成"拿不到就 return
+        //   nullptr"之后,**如果这里还留着 CHECK,只是把 abort 往上挪了一帧**,
+        //   system_server 照样被杀 —— 等于没修。两处必须一起改。
+        //   (这类"改了一条路径、另一条还在"的坑,见记忆
+        //    two-teardown-paths-only-fixed-one。)
+        //
+        //   降级成 ERROR 是安全的:返回值本来就是 shared_ptr,
+        //   ForAllServices() 等调用方对空指针有处理路径(见其 `if (!client) continue`
+        //   语义);最坏结果是这个 codec service 不可用,而不是整机重启。
+        if (!mClient) {
+            LOG(ERROR) << "Failed to create Codec2Client to service \""
                        << GetServiceNames()[mIndex] << "\". (Index = "
-                       << mIndex << ").";
+                       << mIndex << "). Skipping this service.";
+        }
         return mClient;
     }
 
@@ -280,7 +292,15 @@ public:
             // Spin until _listComponents() is successful.
             while (true) {
                 std::shared_ptr<Codec2Client> client = getClient();
-                mTraits = client->_listComponents(&success);
+                // ★ 同上:getClient() 可能返回 nullptr(见其注释)。
+                //   这里原本直接 client->,且外层是**无限自旋**循环 ——
+                //   空指针会直接 SIGSEGV。加防护后走下面的 retry 分支重试,
+                //   服务起来了自然就成功了(这正是这个循环本来的意图)。
+                if (!client) {
+                    success = false;
+                } else {
+                    mTraits = client->_listComponents(&success);
+                }
                 if (success) {
                     break;
                 }
@@ -2381,6 +2401,25 @@ c2_status_t Codec2Client::createInterface(
                 if (status != C2_OK) {
                     return;
                 }
+                // ★★★ 2026-08-16 真机 tombstone 定位:HIDL 侧缺空指针检查。
+                //   崩溃现场(tombstone_08,mediaserver,Process uptime 9s):
+                //     signal 11 (SIGSEGV) fault addr 0x0 "null pointer dereference"
+                //     #00 libcodec2_client.so
+                //         Codec2ConfigurableClient::HidlImpl::HidlImpl(...)+80
+                //     #11 libsfplugin_ccodec.so Codec2InfoBuilder::buildMediaCodecList
+                //   ⇒ 开机枚举 codec 时,HAL 回了 status==C2_OK 但 i==nullptr,
+                //     Interface 构造函数里 `base->getName(...)` 直接解引用 null。
+                //
+                // ★ 这是上游自己的**两条路径不一致**:上面 AIDL 分支
+                //   (`else if (!aidlInterface)`)有这个检查并返回 C2_CORRUPTED,
+                //   HIDL 分支却没有。本机走的正是 HIDL(崩栈里是
+                //   android.hardware.media.c2@1.0.so),所以只在这边炸。
+                //   这里把 AIDL 侧已有的检查补齐,行为与之对齐。
+                if (i == nullptr) {
+                    LOG(ERROR) << "createInterface -- null interface.";
+                    status = C2_CORRUPTED;
+                    return;
+                }
                 *interface = std::make_shared<Interface>(i);
             });
     if (!transStatus.isOk()) {
@@ -2780,13 +2819,50 @@ std::shared_ptr<Codec2Client> Codec2Client::_CreateFromIndex(size_t index) {
         }
     } else {
         std::string instanceName = "android.hardware.media.c2/" + name;
-        sp<HidlBase> baseStore = HidlBase::getService(name);
-        CHECK(baseStore) << "Codec2 service \"" << name << "\""
-                            " inaccessible for unknown reasons.";
+        // ★★★ 2026-08-16 真机 tombstone 定位(tombstone_33,system_server SIGABRT):
+        //     #00 abort  #01 art::Runtime::Abort  #03 LogMessage::~LogMessage
+        //     #04 Codec2Client::_CreateFromIndex+1928  #05 Cache::getClient
+        //   ⇒ 就是下面这条 CHECK 失败后 abort,而调用方是 **system_server**,
+        //     于是整机重启(不只是媒体进程挂掉)。
+        //
+        // ★ 两处上游不一致,都在这一小段里:
+        //   ① AIDL 分支(本函数上方)用的是 `AServiceManager_waitForService`,
+        //      HIDL 分支却用裸 `getService` —— **lazy HAL 用 getService 拿不到**:
+        //      它只查"已注册的",返回 null 且**不触发启动**(本机 virtual_camera
+        //      踩过同一个坑,见记忆 lazy-hal-needs-waitforservice)。
+        //      c2 HAL 在开机早期尚未注册完时,这里就会拿到 null。
+        //   ② 拿不到就 `CHECK` → abort。对**开机期的暂态竞争**用致命断言,
+        //      代价是整个 system_server 被杀。
+        //
+        //   修法:HIDL 侧改用 `tryGetService` 轮询等待(HIDL 没有 AIDL 那种
+        //   waitForService,tryGetService + 重试是等价手段),并且**拿不到就
+        //   返回 nullptr 而不是 abort** —— 调用方 _CreateFromIndex 的返回值
+        //   本来就是 shared_ptr,上层有 null 处理路径(函数末尾就 return nullptr)。
+        //   ⇒ 最坏情况是少一个 codec service,而不是整机重启。
+        sp<HidlBase> baseStore;
+        for (int retry = 0; retry < 20; ++retry) {   // 最多等 ~5s
+            baseStore = HidlBase::tryGetService(name);
+            if (baseStore != nullptr) {
+                break;
+            }
+            if (retry == 0) {
+                LOG(WARNING) << "Codec2 service \"" << name << "\" not yet registered; "
+                                "waiting for it to come up (lazy HAL / boot race).";
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+        if (baseStore == nullptr) {
+            LOG(ERROR) << "Codec2 service \"" << name << "\" inaccessible after retries; "
+                          "skipping this service instead of aborting the process.";
+            return nullptr;
+        }
         LOG(VERBOSE) << "Client to Codec2 service \"" << name << "\" created";
         Return<sp<c2_hidl::IConfigurable>> transResult = baseStore->getConfigurable();
-        CHECK(transResult.isOk()) << "Codec2 service \"" << name << "\""
-                                    "does not have IConfigurable.";
+        if (!transResult.isOk()) {
+            LOG(ERROR) << "Codec2 service \"" << name << "\" does not have IConfigurable; "
+                          "skipping this service instead of aborting the process.";
+            return nullptr;
+        }
         sp<c2_hidl::IConfigurable> configurable =
             static_cast<sp<c2_hidl::IConfigurable>>(transResult);
         return std::make_shared<Codec2Client>(baseStore, configurable, index);
@@ -2827,6 +2903,19 @@ c2_status_t Codec2Client::ForAllServices(
         Cache& cache = Cache::List()[index];
         for (size_t tries = numberOfAttempts; tries > 0; --tries) {
             std::shared_ptr<Codec2Client> client{cache.getClient()};
+            // ★★ 2026-08-16:getClient() 现在拿不到服务时会返回 nullptr
+            //   (原来是 CHECK 直接 abort 掉 system_server,见那边的注释)。
+            //   ⇒ 这里**必须**加空指针防护:下面 `predicate(client)` 和
+            //     C2_TRANSACTION_FAILED 分支里的 `client->getName()` 都会解引用。
+            //   ⚠️ 我一开始以为这个调用方"本来就有 null 处理路径",
+            //     去读了才发现**没有** —— 那样改等于把 abort 换成 SIGSEGV。
+            //     (教训:别假设调用方能处理,要去读。)
+            if (!client) {
+                LOG(WARNING) << "\"" << key << "\": service at index " << index
+                             << " unavailable; trying next service.";
+                status = C2_NO_INIT;
+                break;  // 这个 service 拿不到,换下一个 index,别在同一个上重试
+            }
             status = predicate(client);
             if (status == C2_OK) {
                 std::scoped_lock lock{key2IndexMutex};
@@ -2956,8 +3045,9 @@ std::shared_ptr<Codec2Client::InputSurface> Codec2Client::CreateInputSurface(
 
     std::shared_ptr<Codec2Client::InputSurface> inputSurface;
     if (index != GetServiceNames().size()) {
+        // ★ 同上:getClient() 可能返回 nullptr(见其注释),这里原本直接 client->
         std::shared_ptr<Codec2Client> client = Cache::List()[index].getClient();
-        if (client->createInputSurface(&inputSurface) == C2_OK) {
+        if (client && client->createInputSurface(&inputSurface) == C2_OK) {
             return inputSurface;
         }
     }
@@ -2965,7 +3055,7 @@ std::shared_ptr<Codec2Client::InputSurface> Codec2Client::CreateInputSurface(
                  "from all services...";
     for (Cache& cache : Cache::List()) {
         std::shared_ptr<Codec2Client> client = cache.getClient();
-        if (client->createInputSurface(&inputSurface) == C2_OK) {
+        if (client && client->createInputSurface(&inputSurface) == C2_OK) {
             LOG(INFO) << "CreateInputSurface -- input surface obtained from "
                          "service \"" << client->getServiceName() << "\"";
             return inputSurface;
