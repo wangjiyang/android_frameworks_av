@@ -984,9 +984,36 @@ status_t HidlCamera3Device::HidlHalInterface::configureStreams(
             return BAD_VALUE;
         }
         if (src->use_case != ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES_DEFAULT) {
-            ALOGE("%s: Camera device doesn't support non-default stream use case %" PRId64 "!",
+            // ★★★ 2026-08-13 真机复现:这条 return BAD_VALUE 会让**整个会话**建不起来:
+            //     E HidlCamera3-Device: Camera device doesn't support non-default
+            //                           stream use case 1!
+            //     E Camera3-Device: configureStreamsLocked: Set of requested
+            //                       inputs/outputs not supported by HAL
+            //     E CameraDeviceClient: endConfigure: Unsupported set of inputs/outputs
+            //     E CameraActivity: Error: code: 4, type: CRITICAL
+            //     → wm_finish_activity ... app-request   ← 用户看到的"相机闪退"
+            //   ⚠️ 进程不死、只 finish Activity ⇒ crash buffer / tombstone /
+            //      dumpsys activity exit-info **全都查不到**。
+            //
+            //   为什么会走到这:本机六台相机都**没声明**
+            //   ANDROID_SCALER_AVAILABLE_STREAM_USE_CASES,而 CameraX 在某些
+            //   配置下仍会给流打上 use case 1(PREVIEW)/2(STILL_CAPTURE)。
+            //   ★ 我先前在 SessionConfigurationUtils::isStreamUseCaseSupported 放行了,
+            //     但那只是**上层**校验;真正把会话打回来的是这里的 HIDL 转换层,
+            //     它压根不看设备声明,只认 DEFAULT。⇒ 上层放行、下层照拒,
+            //     表现就是"改了却没用"。两层必须一起改。
+            //
+            //   为什么降级成"忽略"是安全的:use case 只是**给 HAL 的性能提示**
+            //   (要不要 ZSL、走哪条 ISP 路径)。HIDL 3.7 的 Stream 结构里根本
+            //   没有承载它的字段,传不下去 ⇒ 忽略掉 = 按普通流处理,
+            //   画面/功能不受影响。而硬拒的代价是整个相机不能用,明显更糟。
+            //
+            //   ⚠️ 仅**降级为警告**,不改变任何其他行为;AIDL 路径
+            //     (AidlCamera3Device)有自己的能力协商,不受这里影响。
+            ALOGW("%s: Camera device doesn't support non-default stream use case %" PRId64
+                    "; ignoring it (HIDL Stream has no field to carry it) instead of "
+                    "failing the whole session.",
                     __FUNCTION__, src->use_case);
-            return BAD_VALUE;
         }
         activeStreams.insert(streamId);
         // Create Buffer ID map if necessary
